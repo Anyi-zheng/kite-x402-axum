@@ -9,7 +9,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
@@ -103,10 +103,14 @@ async fn main() {
     let paid = Router::new()
         .route("/{*path}", any(proxy))
         .with_state(upstream_cfg)
-        .layer(middleware::from_fn_with_state(payment_cfg, x402_payment));
+        .layer(middleware::from_fn_with_state(payment_cfg.clone(), x402_payment));
 
     let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
+        .route(
+            "/readyz",
+            axum::routing::get(readyz).with_state(payment_cfg),
+        )
         .nest("/v1", paid)
         .layer(middleware::from_fn(http_request_logger));
 
@@ -197,6 +201,30 @@ async fn http_request_logger(req: Request, next: Next) -> Response {
 async fn healthz() -> Json<serde_json::Value> {
     tracing::debug!("Handling /healthz request");
     Json(json!({ "status": "ok" }))
+}
+
+async fn readyz(
+    State(payment_cfg): State<Arc<PaymentConfig>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    tracing::debug!("Handling /readyz request");
+    match payment_cfg.facilitator.probe().await {
+        Ok(()) => Ok(Json(json!({
+            "status": "ready",
+            "facilitator": "ok",
+            "network": payment_cfg.chain.network,
+        }))),
+        Err(err) => {
+            tracing::warn!(error = %err, "Readiness probe failed: facilitator unreachable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "facilitator": "unreachable",
+                    "error": err.to_string(),
+                })),
+            ))
+        }
+    }
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
