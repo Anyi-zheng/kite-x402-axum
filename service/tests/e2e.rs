@@ -226,6 +226,41 @@ async fn healthz_is_free_and_never_contacts_the_backends() {
 }
 
 #[tokio::test]
+async fn readyz_probes_facilitator_and_returns_status() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    let resp = svc.get("/readyz").await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["facilitator"], "ok");
+    assert_eq!(body["network"], "eip155:2368");
+}
+
+#[tokio::test]
+async fn readyz_returns_503_when_facilitator_is_down_while_healthz_stays_200() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    for (k, v) in env.iter_mut() {
+        if k == "FACILITATOR_URL" {
+            *v = "http://127.0.0.1:1".into();
+        }
+    }
+    let svc = Service::start(env).await;
+
+    let healthz = svc.get("/healthz").await;
+    assert_eq!(healthz.status(), 200);
+
+    let readyz = svc.get("/readyz").await;
+    assert_eq!(readyz.status(), 503);
+    let body = readyz.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["facilitator"], "unreachable");
+    assert!(body["error"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn unknown_routes_outside_v1_are_404_and_free() {
     let mocks = Mocks::start().await;
     let svc = Service::start_with(&mocks).await;
