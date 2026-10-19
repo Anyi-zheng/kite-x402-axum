@@ -226,6 +226,41 @@ async fn healthz_is_free_and_never_contacts_the_backends() {
 }
 
 #[tokio::test]
+async fn readyz_probes_facilitator_and_returns_status() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    let resp = svc.get("/readyz").await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["facilitator"], "ok");
+    assert_eq!(body["network"], "eip155:2368");
+}
+
+#[tokio::test]
+async fn readyz_returns_503_when_facilitator_is_down_while_healthz_stays_200() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    for (k, v) in env.iter_mut() {
+        if k == "FACILITATOR_URL" {
+            *v = "http://127.0.0.1:1".into();
+        }
+    }
+    let svc = Service::start(env).await;
+
+    let healthz = svc.get("/healthz").await;
+    assert_eq!(healthz.status(), 200);
+
+    let readyz = svc.get("/readyz").await;
+    assert_eq!(readyz.status(), 503);
+    let body = readyz.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["facilitator"], "unreachable");
+    assert!(body["error"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn unknown_routes_outside_v1_are_404_and_free() {
     let mocks = Mocks::start().await;
     let svc = Service::start_with(&mocks).await;
@@ -803,7 +838,7 @@ async fn request_id_is_echoed_and_forwarded_upstream() {
     let mocks = Mocks::start().await;
     let svc = Service::start_with(&mocks).await;
 
-    // Custom valid request ID
+    // Custom valid request ID.
     let reqs = svc.requirements("/v1/items").await;
     let resp = svc
         .http
@@ -828,7 +863,7 @@ async fn request_id_is_echoed_and_forwarded_upstream() {
         Some("trace-client-abc-123")
     );
 
-    // Missing request ID gets auto-generated
+    // Missing request ID gets auto-generated.
     let health = svc.get("/healthz").await;
     assert_eq!(health.status(), 200);
     let auto_id = health
@@ -838,6 +873,104 @@ async fn request_id_is_echoed_and_forwarded_upstream() {
         .to_str()
         .unwrap();
     assert!(auto_id.starts_with("req-"));
+}
+
+#[tokio::test]
+async fn cors_wildcard_handles_preflight_and_exposes_headers() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("CORS_ORIGIN".into(), "*".into()));
+    let svc = Service::start(env).await;
+
+    // 1. Preflight OPTIONS request on /v1/data.
+    let preflight = svc
+        .http
+        .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
+        .header("Origin", "https://app.kiteai.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), 204);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    assert!(preflight
+        .headers()
+        .contains_key("access-control-allow-methods"));
+    assert!(preflight
+        .headers()
+        .contains_key("access-control-allow-headers"));
+
+    // 2. Unpaid GET challenge on /v1/data includes exposed headers.
+    let challenge = svc
+        .http
+        .get(svc.url("/v1/data"))
+        .header("Origin", "https://app.kiteai.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), 402);
+    assert_eq!(
+        challenge
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    let expose = challenge
+        .headers()
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(expose.contains("Payment-Required"));
+    assert!(expose.contains("Payment-Response"));
+}
+
+#[tokio::test]
+async fn cors_origin_matching_and_vary() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push((
+        "CORS_ORIGIN".into(),
+        "https://app.example.com,http://localhost:3000".into(),
+    ));
+    let svc = Service::start(env).await;
+
+    // Matching origin.
+    let preflight = svc
+        .http
+        .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
+        .header("Origin", "https://app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), 204);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(preflight.headers().get("vary").unwrap(), "Origin");
+
+    // Unmatched origin.
+    let unmatched = svc
+        .http
+        .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
+        .header("Origin", "https://unauthorized.org")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unmatched.status(), 204);
+    assert!(!unmatched
+        .headers()
+        .contains_key("access-control-allow-origin"));
 }
 
 // Keep the import used on non-unix targets too.

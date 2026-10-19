@@ -9,7 +9,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
@@ -23,6 +23,9 @@ use kite_x402_axum::{
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
 };
 use serde_json::json;
+
+mod cors;
+use cors::{cors_middleware, CorsConfig};
 
 #[tokio::main]
 async fn main() {
@@ -55,6 +58,8 @@ async fn main() {
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
+    let cors_origin = env_or("CORS_ORIGIN", "");
+    let cors_cfg = Arc::new(CorsConfig::from_env(Some(&cors_origin)));
 
     tracing::info!(
         port = port,
@@ -65,6 +70,8 @@ async fn main() {
         pay_to = %pay_to,
         upstream_url = %upstream_url,
         facilitator_url = %facilitator_url,
+        cors_origin = %cors_origin,
+        cors_enabled = cors_cfg.is_enabled(),
         auth_injected = !upstream_auth_value.is_empty(),
         "Configured kite-x402 wrapper"
     );
@@ -96,13 +103,21 @@ async fn main() {
     let paid = Router::new()
         .route("/{*path}", any(proxy))
         .with_state(upstream_cfg)
-        .layer(middleware::from_fn_with_state(payment_cfg, x402_payment));
+        .layer(middleware::from_fn_with_state(payment_cfg.clone(), x402_payment));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
+        .route(
+            "/readyz",
+            axum::routing::get(readyz).with_state(payment_cfg),
+        )
         .nest("/v1", paid)
         .fallback(not_found)
         .layer(middleware::from_fn(http_request_logger));
+
+    if cors_cfg.is_enabled() {
+        app = app.layer(middleware::from_fn_with_state(cors_cfg, cors_middleware));
+    }
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
@@ -240,6 +255,30 @@ async fn http_request_logger(mut req: Request, next: Next) -> Response {
 async fn healthz() -> Json<serde_json::Value> {
     tracing::debug!("Handling /healthz request");
     Json(json!({ "status": "ok" }))
+}
+
+async fn readyz(
+    State(payment_cfg): State<Arc<PaymentConfig>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    tracing::debug!("Handling /readyz request");
+    match payment_cfg.facilitator.probe().await {
+        Ok(()) => Ok(Json(json!({
+            "status": "ready",
+            "facilitator": "ok",
+            "network": payment_cfg.chain.network,
+        }))),
+        Err(err) => {
+            tracing::warn!(error = %err, "Readiness probe failed: facilitator unreachable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "facilitator": "unreachable",
+                    "error": err.to_string(),
+                })),
+            ))
+        }
+    }
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
