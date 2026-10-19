@@ -816,6 +816,104 @@ async fn an_in_flight_paid_request_completes_before_shutdown() {
     assert!(status.success());
 }
 
+#[tokio::test]
+async fn cors_wildcard_handles_preflight_and_exposes_headers() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("CORS_ORIGIN".into(), "*".into()));
+    let svc = Service::start(env).await;
+
+    // 1. Preflight OPTIONS request on /v1/data
+    let preflight = svc
+        .http
+        .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
+        .header("Origin", "https://app.kiteai.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), 204);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    assert!(preflight
+        .headers()
+        .contains_key("access-control-allow-methods"));
+    assert!(preflight
+        .headers()
+        .contains_key("access-control-allow-headers"));
+
+    // 2. Unpaid GET challenge on /v1/data includes expose headers
+    let challenge = svc
+        .http
+        .get(svc.url("/v1/data"))
+        .header("Origin", "https://app.kiteai.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), 402);
+    assert_eq!(
+        challenge
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    let expose = challenge
+        .headers()
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(expose.contains("Payment-Required"));
+    assert!(expose.contains("Payment-Response"));
+}
+
+#[tokio::test]
+async fn cors_origin_matching_and_vary() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push((
+        "CORS_ORIGIN".into(),
+        "https://app.example.com,http://localhost:3000".into(),
+    ));
+    let svc = Service::start(env).await;
+
+    // Matching origin
+    let preflight = svc
+        .http
+        .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
+        .header("Origin", "https://app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), 204);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(preflight.headers().get("vary").unwrap(), "Origin");
+
+    // Unmatched origin
+    let unmatched = svc
+        .http
+        .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
+        .header("Origin", "https://unauthorized.org")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unmatched.status(), 204);
+    assert!(!unmatched
+        .headers()
+        .contains_key("access-control-allow-origin"));
+}
+
 // Keep the import used on non-unix targets too.
 #[allow(dead_code)]
 fn _unused(_: Reply) {}

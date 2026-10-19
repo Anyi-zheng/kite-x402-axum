@@ -24,6 +24,9 @@ use kite_x402_axum::{
 };
 use serde_json::json;
 
+mod cors;
+use cors::{cors_middleware, CorsConfig};
+
 #[tokio::main]
 async fn main() {
     // Load .env file automatically if present (does not override existing env vars)
@@ -55,6 +58,8 @@ async fn main() {
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
+    let cors_origin = env_or("CORS_ORIGIN", "");
+    let cors_cfg = Arc::new(CorsConfig::from_env(Some(&cors_origin)));
 
     tracing::info!(
         port = port,
@@ -65,6 +70,8 @@ async fn main() {
         pay_to = %pay_to,
         upstream_url = %upstream_url,
         facilitator_url = %facilitator_url,
+        cors_origin = %cors_origin,
+        cors_enabled = cors_cfg.is_enabled(),
         auth_injected = !upstream_auth_value.is_empty(),
         "Configured kite-x402 wrapper"
     );
@@ -98,7 +105,7 @@ async fn main() {
         .with_state(upstream_cfg)
         .layer(middleware::from_fn_with_state(payment_cfg.clone(), x402_payment));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route(
             "/readyz",
@@ -106,6 +113,10 @@ async fn main() {
         )
         .nest("/v1", paid)
         .layer(middleware::from_fn(http_request_logger));
+
+    if cors_cfg.is_enabled() {
+        app = app.layer(middleware::from_fn_with_state(cors_cfg, cors_middleware));
+    }
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await

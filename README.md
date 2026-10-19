@@ -63,7 +63,14 @@ The service exposes lightweight Kubernetes-compatible health endpoints outside t
 - **`GET /readyz`** (Readiness probe): Probes downstream dependencies by pinging the configured Kite facilitator `/verify` endpoint with a zero-budget probe.
   - Returns `200 OK` with JSON `{"status":"ok","facilitator":"ok"}` when the facilitator is reachable and operational.
   - Returns `503 Service Unavailable` with JSON `{"status":"unavailable","facilitator":"error","error":"..."}` if the facilitator cannot be reached. Useful for load balancers and orchestrators to avoid routing traffic before the settlement gateway is operational.
+## Browser CORS support
 
+The wrapper service supports Cross-Origin Resource Sharing (CORS) for web frontends, browser-based agents, and sandbox environments:
+
+- **Configuration**: Set `CORS_ORIGIN="*"` to allow any origin, or provide a comma-separated list of allowed origins (e.g. `https://app.kiteai.com,http://localhost:3000`).
+- **Zero overhead when disabled**: When `CORS_ORIGIN` is unset (default), CORS middleware is not registered, ensuring zero overhead and complete backward compatibility.
+- **Safe preflight handling**: Browser preflight `OPTIONS` requests receive `204 No Content` with appropriate allow headers without triggering 402 challenges or charging buyers.
+- **Header exposure**: Automatically exposes `Payment-Required`, `Payment-Response`, `X-Payment`, `Payment-Signature`, and `Retry-After` via `Access-Control-Expose-Headers`, allowing browser `fetch()` calls to read 402 challenge parameters and settlement receipts.
 ## Running the tests
 
 ```bash
@@ -180,3 +187,26 @@ version is 1.88, set by the dependency tree (`icu_*` via `reqwest`); keep
 
 See the repository [README](../../README.md) for the full flow and how to
 test with a Kite Passport agent.
+
+## Running with Docker
+
+You can package and deploy the service using the provided multi-stage `Dockerfile`:
+
+```bash
+# Build the production container image
+docker build -t kite-x402-axum-service .
+
+# Run with environment variables
+docker run -d --name kite-service \
+  -p 8402:8402 \
+  -e PAY_TO=0xYourWalletAddress \
+  -e UPSTREAM_URL=https://api.example.com \
+  -e KITE_NETWORK=testnet \
+  kite-x402-axum-service
+```
+
+Or deploy via Docker Compose:
+
+```bash
+docker compose up -d
+```
