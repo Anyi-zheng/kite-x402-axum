@@ -90,6 +90,7 @@ async fn main() {
         price_usd,
         description,
         facilitator: FacilitatorClient::new(facilitator_url),
+        expiration_guard: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: http_client,

@@ -388,6 +388,7 @@ pub fn build_app(facilitator_url: &str, upstream_url: &str, o: &AppOptions) -> R
         price_usd: o.price_usd.clone(),
         description: "Test wrapper".to_string(),
         facilitator,
+        expiration_guard: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: o.upstream_client.clone().unwrap_or_else(upstream_client),
