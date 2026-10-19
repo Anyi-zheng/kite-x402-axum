@@ -84,13 +84,20 @@ async fn main() {
         .build()
         .expect("reqwest client");
 
+    let clock_drift_secs = env::var("PAYMENT_CLOCK_DRIFT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let expiration_guard = clock_drift_secs.map(|drift| {
+        kite_x402_axum::ExpirationGuardConfig::new(drift, 5)
+    });
+
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,
         chain,
         price_usd,
         description,
         facilitator: FacilitatorClient::new(facilitator_url),
-        expiration_guard: None,
+        expiration_guard,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: http_client,
@@ -374,5 +381,15 @@ mod tests {
     async fn healthz_body_is_status_ok_json() {
         let Json(v) = healthz().await;
         assert_eq!(v, json!({ "status": "ok" }));
+    }
+
+    #[test]
+    fn parse_payment_clock_drift_secs() {
+        env::set_var("PAYMENT_CLOCK_DRIFT_SECS", "45");
+        let parsed = env::var("PAYMENT_CLOCK_DRIFT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        assert_eq!(parsed, Some(45));
+        env::remove_var("PAYMENT_CLOCK_DRIFT_SECS");
     }
 }
