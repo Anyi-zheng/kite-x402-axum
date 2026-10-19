@@ -103,7 +103,10 @@ async fn main() {
     let paid = Router::new()
         .route("/{*path}", any(proxy))
         .with_state(upstream_cfg)
-        .layer(middleware::from_fn_with_state(payment_cfg.clone(), x402_payment));
+        .layer(middleware::from_fn_with_state(
+            payment_cfg.clone(),
+            x402_payment,
+        ));
 
     let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
