@@ -128,6 +128,7 @@ fn build_app(facilitator_base: &str, upstream_base: &str) -> Router {
         price_usd: "0.001".to_string(),
         description: "Test wrapper".to_string(),
         facilitator: FacilitatorClient::new(facilitator_base),
+        expiration_guard: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: reqwest::Client::new(),

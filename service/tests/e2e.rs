@@ -1270,6 +1270,50 @@ async fn cors_origin_matching_and_vary() {
         .contains_key("access-control-allow-origin"));
 }
 
+fn expired_payment_header(requirements: &PaymentRequirements) -> String {
+    let payload = kite_x402_axum::types::PaymentPayload {
+        x402_version: 2,
+        resource: None,
+        accepted: requirements.clone(),
+        payload: json!({
+            "signature": "0xfixture",
+            "authorization": {
+                "from": PAYER,
+                "to": PAY_TO,
+                "value": requirements.amount,
+                "validAfter": "0",
+                "validBefore": "1000",
+                "nonce": format!("0x{:064x}", 42),
+            }
+        }),
+        extensions: None,
+    };
+    STANDARD.encode(serde_json::to_vec(&payload).unwrap())
+}
+
+#[tokio::test]
+async fn expired_payment_signature_is_rejected_without_calling_facilitator() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("PAYMENT_CLOCK_DRIFT_SECS".into(), "10".into()));
+    let svc = Service::start(env).await;
+
+    let reqs = svc.requirements("/v1/forecast").await;
+    let resp = svc
+        .http
+        .get(svc.url("/v1/forecast"))
+        .header("PAYMENT-SIGNATURE", expired_payment_header(&reqs))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 402);
+    let challenge = header_json(&resp, "payment-required");
+    assert!(challenge["error"].as_str().unwrap().contains("expired"));
+    assert_eq!(mocks.facilitator.verify_count(), 0);
+    assert_eq!(mocks.upstream.count(), 0);
+}
+
 // Keep the import used on non-unix targets too.
 #[allow(dead_code)]
 fn _unused(_: Reply) {}

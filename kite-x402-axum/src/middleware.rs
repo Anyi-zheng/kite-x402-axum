@@ -38,9 +38,36 @@ pub struct PaymentConfig {
     pub description: String,
     /// Client for the Kite facilitator's `/verify` and `/settle`.
     pub facilitator: FacilitatorClient,
+    /// Optional expiration guard to reject expired or premature authorizations early.
+    pub expiration_guard: Option<crate::expiration::ExpirationGuardConfig>,
 }
 
 impl PaymentConfig {
+    pub fn new(
+        pay_to: impl Into<String>,
+        chain: KiteChain,
+        price_usd: impl Into<String>,
+        description: impl Into<String>,
+        facilitator: FacilitatorClient,
+    ) -> Self {
+        Self {
+            pay_to: pay_to.into(),
+            chain,
+            price_usd: price_usd.into(),
+            description: description.into(),
+            facilitator,
+            expiration_guard: None,
+        }
+    }
+
+    pub fn with_expiration_guard(
+        mut self,
+        guard: crate::expiration::ExpirationGuardConfig,
+    ) -> Self {
+        self.expiration_guard = Some(guard);
+        self
+    }
+
     fn requirements(&self) -> Result<PaymentRequirements, String> {
         let asset = self
             .chain
@@ -218,6 +245,33 @@ pub async fn x402_payment(
             cfg.description.clone(),
             Some("No matching payment requirements".to_string()),
         );
+    }
+
+    if let Some(guard) = &cfg.expiration_guard {
+        if let Some(auth) = payload.payload.get("authorization") {
+            let valid_after = auth
+                .get("validAfter")
+                .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()));
+            let valid_before = auth
+                .get("validBefore")
+                .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()));
+
+            if let (Some(va), Some(vb)) = (valid_after, valid_before) {
+                if let Err(e) = guard.validate_now(va, vb) {
+                    tracing::warn!(
+                        uri = %resource_url,
+                        error = %e,
+                        "Payment authorization rejected by expiration guard; returning 402"
+                    );
+                    return payment_required_response(
+                        requirements,
+                        resource_url,
+                        cfg.description.clone(),
+                        Some(e.to_string()),
+                    );
+                }
+            }
+        }
     }
 
     tracing::debug!(
@@ -407,6 +461,7 @@ mod tests {
             price_usd: price.to_string(),
             description: "Unit test service".to_string(),
             facilitator: dead_facilitator(),
+            expiration_guard: None,
         })
     }
 
@@ -729,5 +784,45 @@ mod tests {
             decode_header(&resp, "PAYMENT-REQUIRED")["error"],
             "No matching payment requirements"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_authorization_is_rejected_before_facilitator_call() {
+        let guard = crate::expiration::ExpirationGuardConfig::new(5, 5);
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_expiration_guard(guard),
+        );
+        let reqs = cfg.requirements().unwrap();
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: reqs,
+            payload: json!({
+                "authorization": {
+                    "validAfter": "0",
+                    "validBefore": "1000",
+                }
+            }),
+            extensions: None,
+        };
+        let encoded = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let (svc, reached) = gate(cfg);
+        let resp = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        let header = decode_header(&resp, "PAYMENT-REQUIRED");
+        assert!(header["error"].as_str().unwrap().contains("expired"));
     }
 }
