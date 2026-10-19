@@ -55,6 +55,15 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 - **`WARN` / `ERROR`**: Client errors, payment signature decode failures, requirement mismatches, upstream errors, facilitator connectivity issues or settlement rejections.
 - **Sensitive data protection**: Secret tokens such as `UPSTREAM_AUTH_VALUE` are automatically redacted from logs.
 
+## Browser CORS support
+
+The wrapper service supports Cross-Origin Resource Sharing (CORS) for web frontends, browser-based agents, and sandbox environments:
+
+- **Configuration**: Set `CORS_ORIGIN="*"` to allow any origin, or provide a comma-separated list of allowed origins (e.g. `https://app.kiteai.com,http://localhost:3000`).
+- **Zero overhead when disabled**: When `CORS_ORIGIN` is unset (default), CORS middleware is not registered, ensuring zero overhead and complete backward compatibility.
+- **Safe preflight handling**: Browser preflight `OPTIONS` requests receive `204 No Content` with appropriate allow headers without triggering 402 challenges or charging buyers.
+- **Header exposure**: Automatically exposes `Payment-Required`, `Payment-Response`, `X-Payment`, `Payment-Signature`, and `Retry-After` via `Access-Control-Expose-Headers`, allowing browser `fetch()` calls to read 402 challenge parameters and settlement receipts.
+
 ## Running the tests
 
 ```bash
