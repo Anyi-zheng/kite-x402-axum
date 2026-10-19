@@ -6,9 +6,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use crate::types::{PaymentPayload, PaymentRequired, SettleResponse};
 
-/// A header value could not be base64-decoded or its JSON did not match the
-/// expected x402 shape.
-/// 支付载荷的协议版本不受支持时也返回此错误。
+/// A header value could not be base64-decoded, its JSON did not match the
+/// expected x402 shape, or its payment protocol version is unsupported.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid x402 header value")]
 pub struct WireError;
@@ -20,7 +19,9 @@ pub fn encode_payment_required(pr: &PaymentRequired) -> String {
 
 /// Decodes the `PAYMENT-SIGNATURE` (or `X-PAYMENT`) header value into a
 /// [`PaymentPayload`].
-/// 两种头名称均只接受 x402 v2 载荷，其他版本返回 [`WireError`]。
+///
+/// Both header names accept only x402 v2 payloads. The legacy header name
+/// does not enable v1 payload support. Other versions return [`WireError`].
 pub fn decode_payment_payload(header_value: &str) -> Result<PaymentPayload, WireError> {
     let bytes = match STANDARD.decode(header_value.trim()) {
         Ok(b) => b,

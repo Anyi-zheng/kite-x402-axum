@@ -79,6 +79,14 @@ This crate emits structured diagnostics via [`tracing`](https://crates.io/crates
 
 ## Error semantics — please read
 
+The payment gate accepts only payloads with `x402Version: 2`, through either
+`PAYMENT-SIGNATURE` or the legacy `X-PAYMENT` header name. The legacy name
+does not add support for the v1 payload format. Unsupported, missing, or
+malformed versions receive the existing `402` challenge with
+`error: "Invalid payment signature"` before any facilitator or upstream
+call. `PAYMENT-SIGNATURE` takes precedence when both headers are present;
+an invalid preferred header does not fall back to the legacy header.
+
 The TypeScript and Go x402 SDKs disagree with each other on the HTTP
 status used when the **facilitator itself** is unreachable (as opposed to
 the facilitator answering "payment invalid"). This crate deliberately
