@@ -14,9 +14,11 @@ use axum::{
 use serde_json::json;
 
 /// Request headers that must never be blindly forwarded between hops.
-/// Matches the Express template's `HOP_BY_HOP` set.
+/// Connection-specific fields are removed in addition to this fixed set.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
+    "proxy-authenticate",
+    "proxy-authorization",
     "keep-alive",
     "transfer-encoding",
     "te",
@@ -30,6 +32,16 @@ const HOP_BY_HOP: &[&str] = &[
 /// gate accepts both (`X-PAYMENT` is the legacy x402 v1 name), so the proxy
 /// must drop both: the upstream API has no business seeing a payment payload.
 const PAYMENT_HEADERS: &[&str] = &["payment-signature", "x-payment"];
+
+/// Collect all connection options before removing the Connection header.
+/// Repeated fields and comma-separated options both name hop-local headers.
+fn connection_options<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .flat_map(|value| value.split(','))
+        .map(|option| option.trim().to_ascii_lowercase())
+        .filter(|option| !option.is_empty())
+        .collect()
+}
 
 /// Maximum number of same-origin redirects [`same_origin_redirect_policy`]
 /// will follow.
@@ -220,9 +232,19 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
         .unwrap_or(reqwest::Method::GET);
 
     let mut out_headers = reqwest::header::HeaderMap::new();
+    let request_options = connection_options(
+        parts
+            .headers
+            .get_all("connection")
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
     for (name, value) in parts.headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) || PAYMENT_HEADERS.contains(&lower.as_str()) {
+        if HOP_BY_HOP.contains(&lower.as_str())
+            || PAYMENT_HEADERS.contains(&lower.as_str())
+            || request_options.contains(&lower)
+        {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -287,9 +309,16 @@ pub async fn proxy(State(cfg): State<Arc<UpstreamConfig>>, req: Request) -> Resp
     // streamed exactly as received (the client is not expected to decompress),
     // so the header is the only thing telling the buyer how to decode it.
     let mut builder = Response::builder().status(status);
+    let response_options = connection_options(
+        upstream_response
+            .headers()
+            .get_all("connection")
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
     for (name, value) in upstream_response.headers().iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str()) {
+        if HOP_BY_HOP.contains(&lower.as_str()) || response_options.contains(&lower) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
