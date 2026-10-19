@@ -62,6 +62,7 @@
 //! also guarantees — is untouched: a request is only settled after the
 //! upstream responds with a status below 400.
 
+pub mod expiration;
 pub mod facilitator;
 pub mod kite;
 pub mod middleware;
@@ -69,6 +70,7 @@ pub mod proxy;
 pub mod types;
 pub mod wire;
 
+pub use expiration::{ExpirationError, ExpirationGuardConfig};
 pub use facilitator::{FacilitatorClient, FacilitatorError};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
 pub use middleware::{x402_payment, PaymentConfig};
