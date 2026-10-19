@@ -51,10 +51,11 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 ```
 
 - **`INFO`**: High-level lifecycle events (server startup, listening address, network/chain configuration, 402 challenge issuance, payment verification success, on-chain settlement success with transaction hash, graceful shutdown).
-- **`DEBUG`**: Detailed diagnostic traces (payment requirements comparison, facilitator `/verify` and `/settle` requests, upstream proxy path and headers, round-trip timings and status codes).
+- **`DEBUG`**: Detailed diagnostic traces (payment requirements comparison, facilitator `/verify` and `/settle` requests, upstream proxy paths, HTTP header names, round-trip timings and status codes).
 - **`WARN` / `ERROR`**: Client errors, payment signature decode failures, requirement mismatches, upstream errors, facilitator connectivity issues or settlement rejections.
-- **Sensitive data protection**: Secret tokens such as `UPSTREAM_AUTH_VALUE` are automatically redacted from logs.
-- **`X-Request-Id` tracing**: Every request receives an `x-request-id` correlation identifier (echoing incoming alphanumeric headers or generating a unique `req-<timestamp>-<counter>` identifier). The request ID is attached to all outbound responses (including 402 challenges and error responses) and forwarded to the upstream API.
+- **HTTP header privacy**: The service's request and response header diagnostics record names only. Values are omitted for every header, including `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, all x402 payment headers, and custom credential headers. Repeated and binary header values receive the same protection. The request and response headers sent over HTTP are preserved.
+- **Log fields**: Request diagnostics use `header_names`; response diagnostics use `response_header_names`. These replace the previous `headers` and `response_headers` fields containing full header maps. Method, URI, request ID, status, and latency remain available. This protection applies to HTTP header diagnostics; it does not sanitize URIs or facilitator response bodies logged elsewhere.
+- **`X-Request-Id` tracing**: Every request receives an `x-request-id` correlation identifier (echoing incoming alphanumeric headers or generating a unique `req-<timestamp>-<counter>` identifier). The request ID is attached to all outbound responses (including 402 challenges and error responses) and forwarded to the upstream API. Its value is logged separately as `request_id` for correlation.
 
 ## Error Responses
 
