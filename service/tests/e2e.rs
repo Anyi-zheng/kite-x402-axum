@@ -817,13 +817,72 @@ async fn an_in_flight_paid_request_completes_before_shutdown() {
 }
 
 #[tokio::test]
+async fn unknown_routes_return_structured_json_404_with_request_id() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    let resp = svc.get("/unknown-route").await;
+    assert_eq!(resp.status(), 404);
+    assert!(resp.headers().contains_key("x-request-id"));
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({
+            "error": "not_found",
+            "message": "route not found"
+        })
+    );
+}
+
+#[tokio::test]
+async fn request_id_is_echoed_and_forwarded_upstream() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    // Custom valid request ID.
+    let reqs = svc.requirements("/v1/items").await;
+    let resp = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("PAYMENT-SIGNATURE", payment_header(&reqs))
+        .header("X-Request-Id", "trace-client-abc-123")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "trace-client-abc-123"
+    );
+    assert_eq!(
+        mocks.upstream.last().header("x-request-id"),
+        Some("trace-client-abc-123")
+    );
+
+    // Missing request ID gets auto-generated.
+    let health = svc.get("/healthz").await;
+    assert_eq!(health.status(), 200);
+    let auto_id = health
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(auto_id.starts_with("req-"));
+}
+
+#[tokio::test]
 async fn cors_wildcard_handles_preflight_and_exposes_headers() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
     env.push(("CORS_ORIGIN".into(), "*".into()));
     let svc = Service::start(env).await;
 
-    // 1. Preflight OPTIONS request on /v1/data
+    // 1. Preflight OPTIONS request on /v1/data.
     let preflight = svc
         .http
         .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
@@ -846,7 +905,7 @@ async fn cors_wildcard_handles_preflight_and_exposes_headers() {
         .headers()
         .contains_key("access-control-allow-headers"));
 
-    // 2. Unpaid GET challenge on /v1/data includes expose headers
+    // 2. Unpaid GET challenge on /v1/data includes exposed headers.
     let challenge = svc
         .http
         .get(svc.url("/v1/data"))
@@ -882,7 +941,7 @@ async fn cors_origin_matching_and_vary() {
     ));
     let svc = Service::start(env).await;
 
-    // Matching origin
+    // Matching origin.
     let preflight = svc
         .http
         .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))
@@ -900,7 +959,7 @@ async fn cors_origin_matching_and_vary() {
     );
     assert_eq!(preflight.headers().get("vary").unwrap(), "Origin");
 
-    // Unmatched origin
+    // Unmatched origin.
     let unmatched = svc
         .http
         .request(reqwest::Method::OPTIONS, svc.url("/v1/data"))

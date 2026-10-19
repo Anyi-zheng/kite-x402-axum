@@ -54,6 +54,15 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 - **`DEBUG`**: Detailed diagnostic traces (payment requirements comparison, facilitator `/verify` and `/settle` requests, upstream proxy path and headers, round-trip timings and status codes).
 - **`WARN` / `ERROR`**: Client errors, payment signature decode failures, requirement mismatches, upstream errors, facilitator connectivity issues or settlement rejections.
 - **Sensitive data protection**: Secret tokens such as `UPSTREAM_AUTH_VALUE` are automatically redacted from logs.
+- **`X-Request-Id` tracing**: Every request receives an `x-request-id` correlation identifier (echoing incoming alphanumeric headers or generating a unique `req-<timestamp>-<counter>` identifier). The request ID is attached to all outbound responses (including 402 challenges and error responses) and forwarded to the upstream API.
+
+## Error Responses
+
+The service emits structured JSON error bodies:
+
+- **`404 Not Found`**: Returns `{"error": "not_found", "message": "route not found"}` for unknown paths outside `/v1/*` and `/healthz`.
+- **`402 Payment Required`**: Issues standard x402 challenge with `PAYMENT-REQUIRED` headers.
+- **`502 Bad Gateway`**: Emitted when the upstream fails, with protected data withheld.
 
 ## Health and Readiness Probes
 
