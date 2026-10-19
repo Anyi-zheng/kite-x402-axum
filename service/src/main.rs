@@ -9,7 +9,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
@@ -23,6 +23,9 @@ use kite_x402_axum::{
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
 };
 use serde_json::json;
+
+mod cors;
+use cors::{cors_middleware, CorsConfig};
 
 #[tokio::main]
 async fn main() {
@@ -55,6 +58,8 @@ async fn main() {
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
+    let cors_origin = env_or("CORS_ORIGIN", "");
+    let cors_cfg = Arc::new(CorsConfig::from_env(Some(&cors_origin)));
 
     tracing::info!(
         port = port,
@@ -65,6 +70,8 @@ async fn main() {
         pay_to = %pay_to,
         upstream_url = %upstream_url,
         facilitator_url = %facilitator_url,
+        cors_origin = %cors_origin,
+        cors_enabled = cors_cfg.is_enabled(),
         auth_injected = !upstream_auth_value.is_empty(),
         "Configured kite-x402 wrapper"
     );
@@ -96,12 +103,21 @@ async fn main() {
     let paid = Router::new()
         .route("/{*path}", any(proxy))
         .with_state(upstream_cfg)
-        .layer(middleware::from_fn_with_state(payment_cfg, x402_payment));
+        .layer(middleware::from_fn_with_state(payment_cfg.clone(), x402_payment));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
+        .route(
+            "/readyz",
+            axum::routing::get(readyz).with_state(payment_cfg),
+        )
         .nest("/v1", paid)
+        .fallback(not_found)
         .layer(middleware::from_fn(http_request_logger));
+
+    if cors_cfg.is_enabled() {
+        app = app.layer(middleware::from_fn_with_state(cors_cfg, cors_middleware));
+    }
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
@@ -120,25 +136,74 @@ async fn main() {
     tracing::info!("Server shut down gracefully");
 }
 
-async fn http_request_logger(req: Request, next: Next) -> Response {
+static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn is_valid_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'~' || b == b'-')
+}
+
+fn generate_request_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let count = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("req-{:x}-{:08x}", now, count)
+}
+
+async fn not_found() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "not_found",
+            "message": "route not found"
+        })),
+    )
+}
+
+async fn http_request_logger(mut req: Request, next: Next) -> Response {
     let start = std::time::Instant::now();
     let method = req.method().clone();
     let uri = req.uri().clone();
 
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|h| h.to_str().ok())
+        .filter(|s| is_valid_request_id(s))
+        .map(|s| s.to_string())
+        .unwrap_or_else(generate_request_id);
+
+    if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
+        req.headers_mut().insert("x-request-id", val);
+    }
+
     tracing::debug!(
+        request_id = %request_id,
         method = %method,
         uri = %uri,
         headers = ?req.headers(),
         "--> Incoming HTTP request"
     );
 
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
+
+    if !response.headers().contains_key("x-request-id") {
+        if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert("x-request-id", val);
+        }
+    }
 
     let latency = start.elapsed();
     let status = response.status();
 
     if status.is_server_error() {
         tracing::error!(
+            request_id = %request_id,
             method = %method,
             uri = %uri,
             status = status.as_u16(),
@@ -147,6 +212,7 @@ async fn http_request_logger(req: Request, next: Next) -> Response {
         );
     } else if status == StatusCode::PAYMENT_REQUIRED {
         tracing::info!(
+            request_id = %request_id,
             method = %method,
             uri = %uri,
             status = status.as_u16(),
@@ -155,6 +221,7 @@ async fn http_request_logger(req: Request, next: Next) -> Response {
         );
     } else if status.is_client_error() {
         tracing::warn!(
+            request_id = %request_id,
             method = %method,
             uri = %uri,
             status = status.as_u16(),
@@ -163,6 +230,7 @@ async fn http_request_logger(req: Request, next: Next) -> Response {
         );
     } else {
         tracing::info!(
+            request_id = %request_id,
             method = %method,
             uri = %uri,
             status = status.as_u16(),
@@ -172,6 +240,7 @@ async fn http_request_logger(req: Request, next: Next) -> Response {
     }
 
     tracing::debug!(
+        request_id = %request_id,
         method = %method,
         uri = %uri,
         status = status.as_u16(),
@@ -186,6 +255,30 @@ async fn http_request_logger(req: Request, next: Next) -> Response {
 async fn healthz() -> Json<serde_json::Value> {
     tracing::debug!("Handling /healthz request");
     Json(json!({ "status": "ok" }))
+}
+
+async fn readyz(
+    State(payment_cfg): State<Arc<PaymentConfig>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    tracing::debug!("Handling /readyz request");
+    match payment_cfg.facilitator.probe().await {
+        Ok(()) => Ok(Json(json!({
+            "status": "ready",
+            "facilitator": "ok",
+            "network": payment_cfg.chain.network,
+        }))),
+        Err(err) => {
+            tracing::warn!(error = %err, "Readiness probe failed: facilitator unreachable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "facilitator": "unreachable",
+                    "error": err.to_string(),
+                })),
+            ))
+        }
+    }
 }
 
 fn env_or(key: &str, fallback: &str) -> String {

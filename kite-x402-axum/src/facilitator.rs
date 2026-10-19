@@ -92,6 +92,39 @@ impl FacilitatorClient {
         self.call("settle", payload, requirements).await
     }
 
+    /// Checks connectivity to the facilitator. Returns `Ok(())` if the facilitator
+    /// responds with status < 500, or a [`FacilitatorError`] on connection failure or 5xx.
+    pub async fn probe(&self) -> Result<(), FacilitatorError> {
+        let url = format!("{}/supported", self.base_url);
+        tracing::debug!(url = %url, "Probing facilitator readiness");
+
+        let response = match self.http.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let base_resp = self.http.get(&self.base_url).send().await;
+                match base_resp {
+                    Ok(r) if r.status().as_u16() < 500 => return Ok(()),
+                    _ => {
+                        tracing::error!(url = %url, error = %err, "Facilitator probe failed");
+                        return Err(FacilitatorError::Request(err));
+                    }
+                }
+            }
+        };
+
+        let status = response.status();
+        if status.as_u16() < 500 {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(FacilitatorError::BadResponse {
+                op: "probe",
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
         op: &'static str,
@@ -638,5 +671,21 @@ mod tests {
             assert!(t.await.unwrap());
         }
         assert_eq!(fake.seen().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn probe_returns_ok_when_facilitator_is_reachable() {
+        let (url, _) = start().await;
+        let client = FacilitatorClient::new(&url);
+        assert!(client.probe().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn probe_fails_when_facilitator_is_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = FacilitatorClient::new(format!("http://{addr}"));
+        assert!(client.probe().await.is_err());
     }
 }
