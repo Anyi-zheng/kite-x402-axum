@@ -46,6 +46,7 @@ struct Service {
     child: Child,
     port: u16,
     http: reqwest::Client,
+    logs: Option<std::thread::JoinHandle<String>>,
 }
 
 impl Service {
@@ -61,22 +62,42 @@ impl Service {
         ]
     }
 
+    fn debug_env(mocks: &Mocks, port: u16) -> Vec<(String, String)> {
+        let mut env = Self::base_env(mocks, port);
+        env.extend([
+            (
+                "RUST_LOG".into(),
+                "kite_x402_service=debug,kite_x402_axum=debug".into(),
+            ),
+            ("NO_COLOR".into(), "1".into()),
+        ]);
+        env
+    }
+
     async fn start(env: Vec<(String, String)>) -> Service {
         let port: u16 = env
             .iter()
             .find(|(k, _)| k == "PORT")
             .map(|(_, v)| v.parse().unwrap())
             .unwrap();
-        let child = Command::new(BIN)
+        let mut child = Command::new(BIN)
             .env_clear()
             .envs(env)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn service binary");
+        let mut stdout = child.stdout.take().unwrap();
+        // Drain logs continuously so DEBUG output cannot block the service on a full pipe.
+        let logs = std::thread::spawn(move || {
+            let mut output = String::new();
+            stdout.read_to_string(&mut output).unwrap();
+            output
+        });
         let mut svc = Service {
             child,
             port,
+            logs: Some(logs),
             // Never follow redirects or use system proxies: we test the service as-is.
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -95,6 +116,12 @@ impl Service {
 
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    fn stop_and_read_logs(mut self) -> String {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.logs.take().unwrap().join().unwrap()
     }
 
     async fn wait_until_ready(&mut self) {
@@ -179,6 +206,9 @@ impl Drop for Service {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(logs) = self.logs.take() {
+            let _ = logs.join();
+        }
     }
 }
 
@@ -205,6 +235,273 @@ fn run_expecting_failure(env: Vec<(&str, &str)>) -> (ExitStatus, String) {
         out.status,
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+// ===========================================================================
+// HTTP header privacy
+// ===========================================================================
+
+#[tokio::test]
+async fn debug_header_logs_protect_credentials_during_paid_requests() {
+    let mocks = Mocks::start().await;
+    let mut reply = UpstreamReply::json(200);
+    reply.headers.extend([
+        (
+            "set-cookie".into(),
+            "session=fixture-session; HttpOnly".into(),
+        ),
+        (
+            "set-cookie".into(),
+            "refresh=fixture-refresh; HttpOnly".into(),
+        ),
+        ("x-response-secret".into(), "fixture-response-secret".into()),
+    ]);
+    mocks.upstream.set_reply(reply);
+    let mut env = Service::debug_env(&mocks, free_port());
+    env.extend([
+        (
+            "UPSTREAM_AUTH_HEADER".into(),
+            "X-Upstream-Credential".into(),
+        ),
+        (
+            "UPSTREAM_AUTH_VALUE".into(),
+            "fixture-injected-credential".into(),
+        ),
+    ]);
+    let svc = Service::start(env).await;
+    let challenge = svc.get("/v1/forecast").await;
+    assert_eq!(challenge.status(), 402);
+    let required_header = challenge.headers()["payment-required"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let requirements =
+        serde_json::from_value(header_json(&challenge, "payment-required")["accepts"][0].clone())
+            .unwrap();
+    let signature_header = payment_header(&requirements);
+    let mut receipt_header = String::new();
+
+    for payment_name in ["PAYMENT-SIGNATURE", "X-PAYMENT"] {
+        let paid = svc
+            .http
+            .get(svc.url("/v1/forecast"))
+            .header(payment_name, &signature_header)
+            .header("Authorization", "Bearer fixture-buyer-credential")
+            .header("Cookie", "session=fixture-buyer-cookie")
+            .header("X-Custom-Credential", "fixture-custom-credential")
+            .header("X-Upstream-Credential", "fixture-overridden-credential")
+            .header("X-Request-Id", "paid-header-log-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), 200);
+        assert_eq!(paid.headers()["x-request-id"], "paid-header-log-test");
+        assert_eq!(
+            paid.headers()["x-response-secret"],
+            "fixture-response-secret"
+        );
+        let cookies: Vec<_> = paid
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies,
+            [
+                "session=fixture-session; HttpOnly",
+                "refresh=fixture-refresh; HttpOnly"
+            ]
+        );
+        receipt_header = paid.headers()["payment-response"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(header_json(&paid, "payment-response")["success"], true);
+        assert_eq!(
+            paid.json::<Value>().await.unwrap(),
+            json!({ "upstream": true })
+        );
+
+        let seen = mocks.upstream.last();
+        assert_eq!(seen.header("x-request-id"), Some("paid-header-log-test"));
+        assert_eq!(
+            seen.header("authorization"),
+            Some("Bearer fixture-buyer-credential")
+        );
+        assert_eq!(seen.header("cookie"), Some("session=fixture-buyer-cookie"));
+        assert_eq!(
+            seen.header("x-custom-credential"),
+            Some("fixture-custom-credential")
+        );
+        assert_eq!(
+            seen.header("x-upstream-credential"),
+            Some("fixture-injected-credential")
+        );
+        assert_eq!(seen.header("payment-signature"), None);
+        assert_eq!(seen.header("x-payment"), None);
+    }
+    assert_eq!(mocks.facilitator.verify_count(), 2);
+    assert_eq!(mocks.upstream.count(), 2);
+    assert_eq!(mocks.facilitator.settle_count(), 2);
+
+    let logs = svc.stop_and_read_logs();
+    assert!(logs.contains("header_names="));
+    assert!(logs.contains("response_header_names="));
+    for name in [
+        "authorization",
+        "cookie",
+        "payment-signature",
+        "x-payment",
+        "set-cookie",
+        "x-custom-credential",
+        "x-response-secret",
+    ] {
+        assert!(
+            logs.contains(name),
+            "missing diagnostic header name: {name}"
+        );
+    }
+    for secret in [
+        "fixture-",
+        &required_header,
+        &signature_header,
+        &receipt_header,
+    ] {
+        assert!(
+            !logs.contains(secret),
+            "HTTP header value leaked into service logs"
+        );
+    }
+    assert!(logs.contains("status=200"));
+    assert!(logs.contains("status=402"));
+    assert!(logs.contains("request_id=paid-header-log-test"));
+    assert!(logs.contains("Payment settled successfully on-chain"));
+}
+
+#[tokio::test]
+async fn debug_header_logs_protect_credentials_on_rejected_and_failed_requests() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start(Service::debug_env(&mocks, free_port())).await;
+    for payment_name in ["PAYMENT-SIGNATURE", "X-PAYMENT"] {
+        let rejected = svc
+            .http
+            .get(svc.url("/v1/forecast"))
+            .header(payment_name, "fixture-malformed-payment")
+            .header("Authorization", "Bearer fixture-rejected-credential")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 402);
+        assert_eq!(
+            header_json(&rejected, "payment-required")["error"],
+            "Invalid payment signature"
+        );
+    }
+    assert!(mocks.timeline().is_empty());
+    let requirements = svc.requirements("/v1/forecast").await;
+    let signature_header = payment_header(&requirements);
+    for status in [401, 500] {
+        let mut reply = UpstreamReply::json(status);
+        reply
+            .headers
+            .push(("set-cookie".into(), "error=fixture-error-cookie".into()));
+        mocks.upstream.set_reply(reply);
+        let failed = svc
+            .http
+            .get(svc.url("/v1/forecast"))
+            .header("PAYMENT-SIGNATURE", &signature_header)
+            .header("Authorization", "Bearer fixture-failed-credential")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(failed.status().as_u16(), status);
+        assert_eq!(failed.headers()["set-cookie"], "error=fixture-error-cookie");
+        assert!(failed.headers().get("payment-response").is_none());
+        assert_eq!(
+            failed.json::<Value>().await.unwrap(),
+            json!({ "upstream": true })
+        );
+    }
+    assert_eq!(mocks.facilitator.verify_count(), 2);
+    assert_eq!(mocks.upstream.count(), 2);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+    let logs = svc.stop_and_read_logs();
+    assert!(!logs.contains("fixture-"));
+    assert!(!logs.contains(&signature_header));
+    for status in [402, 401, 500] {
+        assert!(logs.contains(&format!("status={status}")));
+    }
+    assert!(logs.contains("HTTP request client error"));
+    assert!(logs.contains("HTTP request failed (server error)"));
+}
+
+#[tokio::test]
+async fn debug_header_logs_omit_repeated_and_non_utf8_values() {
+    let mocks = Mocks::start().await;
+    let mut reply = UpstreamReply::json(200);
+    reply.headers.push((
+        "x-binary-response".into(),
+        "fixture-response-\u{00ff}".into(),
+    ));
+    mocks.upstream.set_reply(reply);
+    let svc = Service::start(Service::debug_env(&mocks, free_port())).await;
+    let requirements = svc.requirements("/v1/forecast").await;
+    let paid = svc
+        .http
+        .get(svc.url("/v1/forecast"))
+        .header("PAYMENT-SIGNATURE", payment_header(&requirements))
+        .header("X-Multiple", "fixture-first-value")
+        .header("X-Multiple", "fixture-second-value")
+        .header("Proxy-Authorization", "Basic fixture-proxy-credential")
+        .header("Content-Type", "application/x-fixture-private-type")
+        .header(
+            "X-Binary-Request",
+            reqwest::header::HeaderValue::from_bytes(b"fixture-request-\xff\xfe").unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paid.status(), 200);
+    assert_eq!(
+        paid.headers()["x-binary-response"].as_bytes(),
+        b"fixture-response-\xc3\xbf"
+    );
+    assert_eq!(
+        paid.json::<Value>().await.unwrap(),
+        json!({ "upstream": true })
+    );
+    let seen = mocks.upstream.last();
+    assert_eq!(
+        seen.header_all("x-multiple"),
+        ["fixture-first-value", "fixture-second-value"]
+    );
+    // The shared recording mock decodes request headers with from_utf8_lossy.
+    assert_eq!(
+        seen.header("x-binary-request"),
+        Some("fixture-request-\u{fffd}\u{fffd}")
+    );
+    assert_eq!(
+        seen.header("content-type"),
+        Some("application/x-fixture-private-type")
+    );
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+    assert_eq!(mocks.facilitator.settle_count(), 1);
+    let logs = svc.stop_and_read_logs();
+    assert!(!logs.contains("fixture-"));
+    for name in [
+        "x-multiple",
+        "x-binary-request",
+        "x-binary-response",
+        "proxy-authorization",
+        "content-type",
+    ] {
+        assert!(
+            logs.contains(name),
+            "missing diagnostic header name: {name}"
+        );
+    }
+    assert!(logs.contains("status=200"));
 }
 
 // ===========================================================================

@@ -155,7 +155,7 @@ fn generate_request_id() -> String {
         .unwrap_or_default()
         .as_millis();
     let count = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("req-{:x}-{:08x}", now, count)
+    format!("req-{now:x}-{count:08x}")
 }
 
 async fn not_found() -> (StatusCode, Json<serde_json::Value>) {
@@ -185,11 +185,12 @@ async fn http_request_logger(mut req: Request, next: Next) -> Response {
         req.headers_mut().insert("x-request-id", val);
     }
 
+    // Custom headers can carry credentials too, so log names only.
     tracing::debug!(
         request_id = %request_id,
         method = %method,
         uri = %uri,
-        headers = ?req.headers(),
+        header_names = ?req.headers().keys().collect::<Vec<_>>(),
         "--> Incoming HTTP request"
     );
 
@@ -248,7 +249,7 @@ async fn http_request_logger(mut req: Request, next: Next) -> Response {
         uri = %uri,
         status = status.as_u16(),
         latency = ?latency,
-        response_headers = ?response.headers(),
+        response_header_names = ?response.headers().keys().collect::<Vec<_>>(),
         "<-- HTTP response details"
     );
 
