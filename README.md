@@ -55,6 +55,15 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 - **`WARN` / `ERROR`**: Client errors, payment signature decode failures, requirement mismatches, upstream errors, facilitator connectivity issues or settlement rejections.
 - **Sensitive data protection**: Secret tokens such as `UPSTREAM_AUTH_VALUE` are automatically redacted from logs.
 
+## Health and Readiness Probes
+
+The service exposes lightweight Kubernetes-compatible health endpoints outside the metered `/v1/*` namespace:
+
+- **`GET /healthz`** (Liveness probe): Returns `200 OK` (`"ok"`) immediately without contacting backends. Free and unmetered.
+- **`GET /readyz`** (Readiness probe): Probes downstream dependencies by pinging the configured Kite facilitator `/verify` endpoint with a zero-budget probe.
+  - Returns `200 OK` with JSON `{"status":"ok","facilitator":"ok"}` when the facilitator is reachable and operational.
+  - Returns `503 Service Unavailable` with JSON `{"status":"unavailable","facilitator":"error","error":"..."}` if the facilitator cannot be reached. Useful for load balancers and orchestrators to avoid routing traffic before the settlement gateway is operational.
+
 ## Running the tests
 
 ```bash
