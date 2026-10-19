@@ -171,3 +171,26 @@ version is 1.88, set by the dependency tree (`icu_*` via `reqwest`); keep
 
 See the repository [README](../../README.md) for the full flow and how to
 test with a Kite Passport agent.
+
+## Running with Docker
+
+You can package and deploy the service using the provided multi-stage `Dockerfile`:
+
+```bash
+# Build the production container image
+docker build -t kite-x402-axum-service .
+
+# Run with environment variables
+docker run -d --name kite-service \
+  -p 8402:8402 \
+  -e PAY_TO=0xYourWalletAddress \
+  -e UPSTREAM_URL=https://api.example.com \
+  -e KITE_NETWORK=testnet \
+  kite-x402-axum-service
+```
+
+Or deploy via Docker Compose:
+
+```bash
+docker compose up -d
+```
