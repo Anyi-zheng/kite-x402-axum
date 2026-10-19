@@ -87,9 +87,8 @@ async fn main() {
     let clock_drift_secs = env::var("PAYMENT_CLOCK_DRIFT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
-    let expiration_guard = clock_drift_secs.map(|drift| {
-        kite_x402_axum::ExpirationGuardConfig::new(drift, 5)
-    });
+    let expiration_guard =
+        clock_drift_secs.map(|drift| kite_x402_axum::ExpirationGuardConfig::new(drift, 5));
 
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,

@@ -249,12 +249,16 @@ pub async fn x402_payment(
 
     if let Some(guard) = &cfg.expiration_guard {
         if let Some(auth) = payload.payload.get("authorization") {
-            let valid_after = auth
-                .get("validAfter")
-                .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()));
-            let valid_before = auth
-                .get("validBefore")
-                .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()));
+            let valid_after = auth.get("validAfter").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| v.as_u64())
+            });
+            let valid_before = auth.get("validBefore").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| v.as_u64())
+            });
 
             if let (Some(va), Some(vb)) = (valid_after, valid_before) {
                 if let Err(e) = guard.validate_now(va, vb) {
