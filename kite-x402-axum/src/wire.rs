@@ -8,6 +8,7 @@ use crate::types::{PaymentPayload, PaymentRequired, SettleResponse};
 
 /// A header value could not be base64-decoded or its JSON did not match the
 /// expected x402 shape.
+/// 支付载荷的协议版本不受支持时也返回此错误。
 #[derive(Debug, thiserror::Error)]
 #[error("invalid x402 header value")]
 pub struct WireError;
@@ -19,6 +20,7 @@ pub fn encode_payment_required(pr: &PaymentRequired) -> String {
 
 /// Decodes the `PAYMENT-SIGNATURE` (or `X-PAYMENT`) header value into a
 /// [`PaymentPayload`].
+/// 两种头名称均只接受 x402 v2 载荷，其他版本返回 [`WireError`]。
 pub fn decode_payment_payload(header_value: &str) -> Result<PaymentPayload, WireError> {
     let bytes = match STANDARD.decode(header_value.trim()) {
         Ok(b) => b,
@@ -27,8 +29,12 @@ pub fn decode_payment_payload(header_value: &str) -> Result<PaymentPayload, Wire
             return Err(WireError);
         }
     };
-    match serde_json::from_slice(&bytes) {
-        Ok(p) => Ok(p),
+    match serde_json::from_slice::<PaymentPayload>(&bytes) {
+        Ok(p) if p.x402_version == 2 => Ok(p),
+        Ok(p) => {
+            tracing::debug!(version = p.x402_version, "Unsupported x402 payment version");
+            Err(WireError)
+        }
         Err(e) => {
             tracing::debug!(error = %e, "Failed to parse JSON payment payload");
             Err(WireError)
@@ -78,6 +84,7 @@ mod tests {
     #[test]
     fn round_trips_payment_payload() {
         let decoded = decode_payment_payload(&b64(&sample_payload())).unwrap();
+        assert_eq!(decoded.x402_version, 2);
         assert_eq!(decoded.accepted.amount, "1000");
         assert_eq!(decoded.accepted, sample_requirements());
         assert_eq!(decoded.payload["signature"], "0x...");
@@ -86,6 +93,18 @@ mod tests {
     #[test]
     fn rejects_non_base64() {
         assert!(decode_payment_payload("not base64!!").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_payment_versions() {
+        for version in [0, 1, 3, u32::MAX] {
+            let mut payload = sample_payload();
+            payload.x402_version = version;
+            assert!(
+                decode_payment_payload(&b64(&payload)).is_err(),
+                "unsupported x402Version {version} must be rejected"
+            );
+        }
     }
 
     #[test]
