@@ -390,6 +390,7 @@ pub fn build_app(facilitator_url: &str, upstream_url: &str, o: &AppOptions) -> R
         facilitator,
         expiration_guard: None,
         metrics: None,
+        nonce_guard: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: o.upstream_client.clone().unwrap_or_else(upstream_client),

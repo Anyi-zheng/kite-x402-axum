@@ -151,8 +151,8 @@ impl PaymentNonceReplayGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::types::PaymentRequirements;
+    use serde_json::json;
 
     fn sample_requirements() -> PaymentRequirements {
         PaymentRequirements {

@@ -35,12 +35,56 @@ what happens when the facilitator itself can't be reached.
 
 ## Rate Limiting
 
-The service includes an in-memory token-bucket rate limiter that guards `/v1/*` endpoints before payment verification:
+The service includes an in-memory token-bucket rate limiter that guards `/v1/*`
+before payment verification. It is disabled by default and stores quotas separately
+in each service process; restarting a process resets its buckets. Multiple replicas
+do not share a global quota.
 
-- `RATE_LIMIT_RPS`: Refill rate in requests per second (float, e.g. `100.0`; default `0` = disabled).
-- `RATE_LIMIT_BURST`: Maximum burst capacity (float, e.g. `50.0`; defaults to `RATE_LIMIT_RPS`).
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RATE_LIMIT_RPS` | `0` | Finite, non-negative refill rate in requests per second; `0` disables limiting. Fractional rates are supported. |
+| `RATE_LIMIT_BURST` | `RATE_LIMIT_RPS` | Finite, non-negative burst capacity, with an effective minimum of one token when enabled. |
+| `RATE_LIMIT_TRUSTED_PROXIES` | Empty | Comma-separated proxy IP addresses or CIDRs (IPv4 or IPv6). Forwarding headers from other peers are ignored. |
+| `RATE_LIMIT_MAX_CLIENTS` | `10000` | Maximum cached client IPs, an integer from `1` to `1000000`. |
+| `RATE_LIMIT_IDLE_TIMEOUT_SECS` | `300` | Minimum idle time before a bucket can expire, an integer from `1` to `86400` seconds. |
 
-Clients exceeding the limit receive HTTP `429 Too Many Requests` with `Retry-After: <seconds>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, and `Cache-Control: no-store`. Rate-limited rejections are completely free and never contact the facilitator or upstream. Health checks (`/healthz`) are excluded from rate limits.
+All settings are validated at startup, including when limiting is disabled.
+
+**Client identity and proxy migration.** By default, the client is the TCP peer IP;
+changing `X-Forwarded-For` or `X-Real-IP` cannot create a new quota. Deployments that
+previously relied on forwarding headers must explicitly trust their proxy addresses.
+For example, when the service is reachable through a local reverse proxy:
+
+```bash
+RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 \
+  RATE_LIMIT_TRUSTED_PROXIES=127.0.0.1,::1 cargo run -p kite-x402-service
+```
+
+Only trust proxies you control, and configure them to append the actual connecting
+peer to `X-Forwarded-For`, or overwrite the header with authoritative client data.
+When the TCP peer is trusted, the service reads `X-Forwarded-For` from right to left,
+across repeated header fields, stopping at the first untrusted address. Values to
+its left cannot select the quota. `X-Real-IP` is used only when `X-Forwarded-For` is
+absent and the TCP peer is trusted. Malformed trusted forwarding metadata returns
+`400` with `{"error":"invalid_forwarded_ip"}` and `Cache-Control: no-store`; it
+does not fall back to another header. IPv4-mapped IPv6 addresses share the matching
+IPv4 quota.
+
+**Capacity and expiry.** Both the client cache and its expiry index are bounded by
+`RATE_LIMIT_MAX_CLIENTS`. A bucket expires only after the idle timeout **and** enough
+time to refill completely, so a short timeout cannot reset a low-rate quota early.
+Expired entries are reclaimed on requests, at most 64 per request. When the cache
+is full, unknown clients receive `503` with
+`{"error":"rate_limit_capacity_exceeded"}`, `Retry-After: 1`, and
+`Cache-Control: no-store`. This retry value is a retry hint, not a guarantee that
+capacity will be available in one second. Existing clients retain their quotas.
+
+Clients exceeding their quota receive `429 Too Many Requests` with
+`Retry-After: <seconds>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, and
+`Cache-Control: no-store`. Successful admission also sets `X-RateLimit-Limit` and
+`X-RateLimit-Remaining` on the response, including a payment challenge.
+Rejected requests never contact the facilitator or upstream and incur no payment.
+`/healthz`, `/livez`, and `/metrics` remain free and outside this limiter.
 
 ## Health, Liveness & Diagnostics
 
