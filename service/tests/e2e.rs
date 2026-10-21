@@ -1476,6 +1476,7 @@ async fn security_headers_can_be_disabled_via_env() {
 }
 
 #[tokio::test]
+
 async fn replayed_payment_signature_is_rejected_on_second_request() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
@@ -1507,6 +1508,108 @@ async fn replayed_payment_signature_is_rejected_on_second_request() {
     assert!(challenge["error"].as_str().unwrap().contains("already been used"));
     assert_eq!(mocks.facilitator.verify_count(), 1);
 }
+
+async fn concurrency_overflow_rejects_with_503_before_payment_and_releases_after() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("MAX_CONCURRENT_REQUESTS".into(), "1".into()));
+    let mut reply = UpstreamReply::json(200);
+    reply.delay = Some(Duration::from_millis(600));
+    mocks.upstream.set_reply(reply);
+    let svc = Service::start(env).await;
+
+    let reqs = svc.requirements("/v1/items").await;
+    let client = svc.http.clone();
+    let url = svc.url("/v1/items");
+    let sig = payment_header(&reqs);
+
+    // In-flight request #1 takes the 1 available slot
+    let in_flight = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        let sig = sig.clone();
+        async move {
+            client
+                .get(url)
+                .header("PAYMENT-SIGNATURE", sig)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+
+    // Wait for request #1 to reach upstream
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mocks.upstream.count() == 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Request #2 arrives while capacity is saturated: must be rejected with 503
+    let overflow = client.get(&url).send().await.unwrap();
+    assert_eq!(overflow.status(), 503);
+    assert_eq!(
+        overflow
+            .headers()
+            .get("retry-after")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        overflow
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-store"
+    );
+    assert_eq!(
+        overflow.json::<Value>().await.unwrap(),
+        json!({ "error": "service_busy" })
+    );
+
+    // Healthz is outside /v1 and remains accessible during saturation
+    let health = svc.get("/healthz").await;
+    assert_eq!(health.status(), 200);
+
+    // Let in-flight request finish
+    let resp1 = in_flight.await.unwrap();
+    assert_eq!(resp1.status(), 200);
+
+    // Reset reply delay to zero
+    mocks.upstream.set_reply(UpstreamReply::json(200));
+
+    // Request #3 after slot release succeeds
+    let resp3 = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp3.status(),
+        402,
+        "Challenge issued after permit released"
+    );
+}
+
+#[test]
+fn refuses_invalid_max_concurrent_requests() {
+    for invalid in ["0", "-1", "not_a_number", "10001"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("MAX_CONCURRENT_REQUESTS", invalid),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(
+            !status.success(),
+            "MAX_CONCURRENT_REQUESTS={invalid} must cause startup failure"
+        );
+        assert!(
+            stderr.contains("MAX_CONCURRENT_REQUESTS"),
+            "stderr should mention MAX_CONCURRENT_REQUESTS: {stderr}"
+        );
+    }
+
 }
 
 // Keep the import used on non-unix targets too.

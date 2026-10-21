@@ -101,6 +101,14 @@ async fn main() {
     if !(100..=300000).contains(&facilitator_timeout_ms) {
         panic!("FACILITATOR_TIMEOUT_MS must be between 100 and 300000 ms");
     }
+    let max_concurrent: usize = env_or("MAX_CONCURRENT_REQUESTS", "64")
+        .parse()
+        .expect("MAX_CONCURRENT_REQUESTS must be a number");
+    if !(1..=10000).contains(&max_concurrent) {
+        panic!("MAX_CONCURRENT_REQUESTS must be between 1 and 10000");
+    }
+    let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+
     let settle_retries: u32 = env_or("FACILITATOR_SETTLE_RETRIES", "2")
         .parse()
         .unwrap_or(2);
@@ -130,6 +138,7 @@ async fn main() {
         rate_limit_burst = rate_limit_burst,
         upstream_timeout_ms = upstream_timeout_ms,
         facilitator_timeout_ms = facilitator_timeout_ms,
+        max_concurrent_requests = max_concurrent,
         cors_origin = %cors_origin,
         cors_enabled = cors_cfg.is_enabled(),
         auth_injected = !upstream_auth_value.is_empty(),
@@ -190,6 +199,10 @@ async fn main() {
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),
             rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            concurrency_semaphore,
+            concurrency_limiter,
         ));
 
     let service_metrics = Arc::new(ServiceMetrics::new());
@@ -631,6 +644,29 @@ async fn livez(State(metrics): State<Arc<ServiceMetrics>>) -> Json<serde_json::V
 async fn metrics_endpoint(State(metrics): State<Arc<ServiceMetrics>>) -> Json<serde_json::Value> {
     tracing::debug!("Handling /metrics request");
     Json(metrics.snapshot())
+}
+
+async fn concurrency_limiter(
+    axum::extract::State(semaphore): axum::extract::State<Arc<tokio::sync::Semaphore>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Ok(permit) = semaphore.try_acquire() else {
+        tracing::warn!("Max concurrency capacity reached, rejecting request with 503");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (axum::http::header::RETRY_AFTER, "1"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            Json(json!({ "error": "service_busy" })),
+        )
+            .into_response();
+    };
+
+    let response = next.run(req).await;
+    drop(permit);
+    response
 }
 
 async fn healthz() -> Json<serde_json::Value> {

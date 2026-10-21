@@ -137,6 +137,15 @@ The wrapper service supports Cross-Origin Resource Sharing (CORS) for web fronte
 - **Zero overhead when disabled**: When `CORS_ORIGIN` is unset (default), CORS middleware is not registered, ensuring zero overhead and complete backward compatibility.
 - **Safe preflight handling**: Browser preflight `OPTIONS` requests receive `204 No Content` with appropriate allow headers without triggering 402 challenges or charging buyers.
 - **Header exposure**: Automatically exposes `Payment-Required`, `Payment-Response`, `X-Payment`, `Payment-Signature`, and `Retry-After` via `Access-Control-Expose-Headers`, allowing browser `fetch()` calls to read 402 challenge parameters and settlement receipts.
+
+## Concurrency Admission Control
+
+The service provides built-in concurrency admission control for metered `/v1/*` requests using a semaphore:
+
+- Configured via the `MAX_CONCURRENT_REQUESTS` environment variable (defaults to `64`, accepts integers from `1` to `10000`).
+- If inbound concurrency exceeds the limit, incoming metered requests are immediately rejected with `503 Service Unavailable`, `Retry-After: 1`, `Cache-Control: no-store`, and JSON `{"error": "service_busy"}` before any facilitator verification or upstream proxying takes place.
+- Requests outside `/v1/*` (such as `/healthz`) do not consume concurrency slots and remain accessible during load spikes.
+
 ## Running the tests
 
 ```bash
