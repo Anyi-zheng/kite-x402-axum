@@ -329,6 +329,7 @@ mod tests {
     struct Fake {
         verify: Mutex<(u16, String)>,
         settle: Mutex<(u16, String)>,
+        settle_sequence: Mutex<Vec<(u16, String)>>,
         delay: Mutex<Option<Duration>>,
         seen: Mutex<Vec<Seen>>,
     }
@@ -342,6 +343,7 @@ mod tests {
                     json!({ "success": true, "transaction": "0xtx", "network": "eip155:2368" })
                         .to_string(),
                 )),
+                settle_sequence: Mutex::new(vec![]),
                 delay: Mutex::new(None),
                 seen: Mutex::new(vec![]),
             })
@@ -351,6 +353,9 @@ mod tests {
         }
         fn set_settle(&self, status: u16, body: &str) {
             *self.settle.lock().unwrap() = (status, body.to_string());
+        }
+        fn set_settle_sequence(&self, responses: Vec<(u16, String)>) {
+            *self.settle_sequence.lock().unwrap() = responses;
         }
         fn seen(&self) -> Vec<Seen> {
             self.seen.lock().unwrap().clone()
@@ -376,7 +381,12 @@ mod tests {
         let (status, body) = if path.ends_with("/verify") {
             fake.verify.lock().unwrap().clone()
         } else {
-            fake.settle.lock().unwrap().clone()
+            let mut seq = fake.settle_sequence.lock().unwrap();
+            if !seq.is_empty() {
+                seq.remove(0)
+            } else {
+                fake.settle.lock().unwrap().clone()
+            }
         };
         (StatusCode::from_u16(status).unwrap(), body).into_response()
     }
@@ -797,5 +807,72 @@ mod tests {
         drop(listener);
         let client = FacilitatorClient::new(format!("http://{addr}"));
         assert!(client.probe().await.is_err());
+    }
+
+    #[test]
+    fn retry_config_calculates_exponential_backoff_and_caps_at_maximum() {
+        let config = RetryConfig::new(
+            3,
+            Duration::from_millis(50),
+            Duration::from_millis(300),
+        );
+        assert_eq!(config.calculate_backoff(0), Duration::from_millis(50));
+        assert_eq!(config.calculate_backoff(1), Duration::from_millis(100));
+        assert_eq!(config.calculate_backoff(2), Duration::from_millis(200));
+        assert_eq!(config.calculate_backoff(3), Duration::from_millis(300));
+        assert_eq!(config.calculate_backoff(4), Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn settle_retries_transient_503_and_recovers() {
+        let (url, fake) = start().await;
+        fake.set_settle_sequence(vec![
+            (503, "Service Unavailable".into()),
+            (
+                200,
+                json!({ "success": true, "transaction": "0xretry_tx", "network": "eip155:2368" })
+                    .to_string(),
+            ),
+        ]);
+
+        let retry = RetryConfig::new(2, Duration::from_millis(10), Duration::from_millis(50));
+        let client = FacilitatorClient::new(&url).with_retry_config(retry);
+
+        let res = client.settle(&payload(), &requirements()).await.unwrap();
+        assert!(res.success);
+        assert_eq!(res.transaction, "0xretry_tx");
+        assert_eq!(fake.seen().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn settle_does_not_retry_non_transient_400() {
+        let (url, fake) = start().await;
+        fake.set_settle(400, "Bad Request");
+
+        let retry = RetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50));
+        let client = FacilitatorClient::new(&url).with_retry_config(retry);
+
+        let err = client.settle(&payload(), &requirements()).await.unwrap_err();
+        match err {
+            FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected BadResponse 400, got: {other:?}"),
+        }
+        assert_eq!(fake.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_does_not_retry_by_default() {
+        let (url, fake) = start().await;
+        fake.set_verify(503, "Facilitator Unavailable");
+
+        let retry = RetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50));
+        let client = FacilitatorClient::new(&url).with_retry_config(retry);
+
+        let err = client.verify(&payload(), &requirements()).await.unwrap_err();
+        match err {
+            FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 503),
+            other => panic!("expected BadResponse 503, got: {other:?}"),
+        }
+        assert_eq!(fake.seen().len(), 1);
     }
 }
