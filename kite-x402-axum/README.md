@@ -38,13 +38,13 @@ use kite_x402_axum::{
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
 };
 
-let payment_cfg = Arc::new(PaymentConfig {
-    pay_to: "0xYourWallet".to_string(),
-    chain: kite_chain_by_name("testnet").unwrap(),
-    price_usd: "0.001".to_string(),
-    description: "Paid API access".to_string(),
-    facilitator: FacilitatorClient::new(FACILITATOR_URL),
-});
+let payment_cfg = Arc::new(PaymentConfig::new(
+    "0xYourWallet",
+    kite_chain_by_name("testnet").unwrap(),
+    "0.001",
+    "Paid API access",
+    FacilitatorClient::new(FACILITATOR_URL),
+));
 // Don't follow redirects to other hosts: the injected credential would go along.
 let http = reqwest::Client::builder()
     .redirect(same_origin_redirect_policy())
@@ -72,6 +72,42 @@ reads the same variable names as the Go and TypeScript templates:
 `PAY_TO`, `KITE_NETWORK`, `UPSTREAM_URL`, `PRICE_USD`,
 `UPSTREAM_AUTH_HEADER`, `UPSTREAM_AUTH_VALUE`, `FACILITATOR_URL`,
 `SERVICE_DESCRIPTION`, `PORT`.
+
+## Optional replay guard
+
+Configure `PaymentConfig::with_nonce_guard(Arc<PaymentNonceReplayGuard>)` to enable
+atomic authorization reservations in `x402_payment`. The default has no guard.
+`PaymentNonceReplayGuard::new(capacity, ttl_seconds)` bounds pending and retained
+authorizations. Pending operations never expire; retention TTL starts when an
+operation finishes. Capacity rejects new authorizations instead of evicting live
+records. EIP-3009 keys isolate authorizers, networks and assets and normalize EVM
+hex casing. Other payloads use complete payment data and requirements as an opaque
+identity. Resource and extension metadata are excluded from authorization identity.
+
+Verification failures release reservations. Protected handlers returning >= 400
+also release, since the middleware skips settlement. Any settlement attempt retains
+protection, including timeouts and negative responses. Cancellation after entering
+the protected handler retains protection conservatively. Duplicate payments still
+receive `402`; cache saturation returns `503` with a no-store JSON error before
+backend work. See the root README for the full outcome table and deployment limits.
+
+For custom flows, `reserve(&payload)` returns a `PaymentNonceReservation`. Keep it
+alive throughout the operation; an unprotected drop releases it. Call
+`retain_on_drop()` before entering work whose outcome could become uncertain. A
+known safe failure can consume it with `release()`. Never release an uncertain
+settlement. Clearing the guard is an administrative reset that removes even pending
+protection; old handles cannot change replacement entries.
+
+**Compatibility:** `extract_nonce_key` and `check_and_record` keep their signatures
+and legacy raw-key behavior; the middleware now uses scoped reservations.
+`check_and_record` immediately retains a key and cannot roll back failed work.
+Legacy raw keys are not interchangeable with the middleware's scoped identities;
+custom flows sharing its guard should use `reserve(&payload)`.
+`NonceReplayError` adds `CapacityExceeded`, so exhaustive downstream matches must
+handle that variant. Full caches now reject admission rather than evicting old keys.
+Replay errors from `reserve` redact authorization identifiers; diagnostics do not
+include opaque key contents. Protection remains process-local and TTL-bounded,
+without a distributed or exactly-once guarantee.
 
 ## Logging
 
