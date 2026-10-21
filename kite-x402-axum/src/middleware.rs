@@ -982,7 +982,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp1.status(), StatusCode::PAYMENT_REQUIRED);
         let header1 = decode_header(&resp1, "PAYMENT-REQUIRED");
-        assert!(!header1["error"].as_str().unwrap().contains("already been used"));
+        assert!(!header1["error"]
+            .as_str()
+            .unwrap()
+            .contains("already been used"));
 
         // Second attempt with exact same nonce is rejected by replay guard
         let resp2 = svc
@@ -992,6 +995,9 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(reached.load(Ordering::SeqCst), 0);
         let header2 = decode_header(&resp2, "PAYMENT-REQUIRED");
-        assert!(header2["error"].as_str().unwrap().contains("already been used"));
+        assert!(header2["error"]
+            .as_str()
+            .unwrap()
+            .contains("already been used"));
     }
 }

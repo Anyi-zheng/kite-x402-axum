@@ -3,11 +3,11 @@
 //! Tracks request volumes, 402 challenge issuances, signature verification results,
 //! settlement outcomes, and settlement latency without locks on the fast path.
 
+use serde::{Deserialize, Serialize};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use serde::{Deserialize, Serialize};
 
 /// High-performance thread-safe collector for x402 payment lifecycle events.
 #[derive(Debug, Default)]
