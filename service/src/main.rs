@@ -135,6 +135,27 @@ async fn main() {
         .route("/metrics/x402", axum::routing::get(metrics_x402_handler))
         .with_state(Arc::clone(&metrics));
 
+    let security_enabled = match env::var("SECURITY_HEADERS_ENABLED") {
+        Ok(v) => v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    };
+    let security_csp = env_or("SECURITY_CSP", "default-src 'none'; frame-ancestors 'none'");
+    let security_referrer_policy = env_or(
+        "SECURITY_REFERRER_POLICY",
+        "strict-origin-when-cross-origin",
+    );
+
+    let security_cfg = Arc::new(SecurityHeadersConfig {
+        enabled: security_enabled,
+        csp: security_csp,
+        referrer_policy: security_referrer_policy,
+    });
+
+    tracing::info!(
+        security_headers_enabled = security_enabled,
+        "Configured security headers middleware"
+    );
+
     let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route(
@@ -144,6 +165,10 @@ async fn main() {
         .merge(metrics_router)
         .nest("/v1", paid)
         .fallback(not_found)
+        .layer(middleware::from_fn_with_state(
+            security_cfg,
+            security_headers_middleware,
+        ))
         .layer(middleware::from_fn(http_request_logger));
 
     if cors_cfg.is_enabled() {
@@ -287,6 +312,56 @@ async fn http_request_logger(mut req: Request, next: Next) -> Response {
         response_header_names = ?response.headers().keys().collect::<Vec<_>>(),
         "<-- HTTP response details"
     );
+
+    response
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityHeadersConfig {
+    pub enabled: bool,
+    pub csp: String,
+    pub referrer_policy: String,
+}
+
+impl Default for SecurityHeadersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            csp: "default-src 'none'; frame-ancestors 'none'".to_string(),
+            referrer_policy: "strict-origin-when-cross-origin".to_string(),
+        }
+    }
+}
+
+pub async fn security_headers_middleware(
+    axum::extract::State(cfg): axum::extract::State<Arc<SecurityHeadersConfig>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    if !cfg.enabled {
+        return response;
+    }
+
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::header::X_XSS_PROTECTION,
+        axum::http::HeaderValue::from_static("0"),
+    );
+    if let Ok(val) = axum::http::HeaderValue::from_str(&cfg.referrer_policy) {
+        headers.insert(axum::http::header::REFERRER_POLICY, val);
+    }
+    if let Ok(val) = axum::http::HeaderValue::from_str(&cfg.csp) {
+        headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, val);
+    }
 
     response
 }
@@ -476,5 +551,84 @@ mod tests {
             .and_then(|v| v.trim().parse::<u64>().ok());
         assert_eq!(parsed, Some(45));
         env::remove_var("PAYMENT_CLOCK_DRIFT_SECS");
+    }
+
+    #[tokio::test]
+    async fn security_headers_applied_by_default() {
+        use axum::{body::Body, routing::get};
+        use tower::ServiceExt;
+
+        let cfg = Arc::new(SecurityHeadersConfig::default());
+        let app = Router::new().route("/test", get(|| async { "ok" })).layer(
+            middleware::from_fn_with_state(cfg, security_headers_middleware),
+        );
+
+        let res = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(res.headers()["x-frame-options"], "DENY");
+        assert_eq!(res.headers()["x-xss-protection"], "0");
+        assert_eq!(
+            res.headers()["referrer-policy"],
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(
+            res.headers()["content-security-policy"],
+            "default-src 'none'; frame-ancestors 'none'"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_disabled_when_flag_false() {
+        use axum::{body::Body, routing::get};
+        use tower::ServiceExt;
+
+        let cfg = Arc::new(SecurityHeadersConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let app = Router::new().route("/test", get(|| async { "ok" })).layer(
+            middleware::from_fn_with_state(cfg, security_headers_middleware),
+        );
+
+        let res = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!res.headers().contains_key("x-content-type-options"));
+        assert!(!res.headers().contains_key("x-frame-options"));
+        assert!(!res.headers().contains_key("content-security-policy"));
+    }
+
+    #[tokio::test]
+    async fn security_headers_custom_csp_and_referrer() {
+        use axum::{body::Body, routing::get};
+        use tower::ServiceExt;
+
+        let cfg = Arc::new(SecurityHeadersConfig {
+            enabled: true,
+            csp: "default-src 'self'".to_string(),
+            referrer_policy: "no-referrer".to_string(),
+        });
+        let app = Router::new().route("/test", get(|| async { "ok" })).layer(
+            middleware::from_fn_with_state(cfg, security_headers_middleware),
+        );
+
+        let res = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.headers()["content-security-policy"],
+            "default-src 'self'"
+        );
+        assert_eq!(res.headers()["referrer-policy"], "no-referrer");
     }
 }
