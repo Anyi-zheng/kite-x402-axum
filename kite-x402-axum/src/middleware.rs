@@ -387,6 +387,13 @@ pub async fn x402_payment(
             error_message = ?settle.error_message,
             "Facilitator settlement failed"
         );
+        tracing::warn!(
+            target: "kite_x402::audit",
+            event = "settlement_failure",
+            uri = %resource_url,
+            error_reason = ?settle.error_reason,
+            "Payment settlement audit: failed"
+        );
         return settlement_failure_response(&settle);
     }
 
@@ -397,6 +404,16 @@ pub async fn x402_payment(
         payer = ?settle.payer,
         amount = ?settle.amount,
         "Payment settled successfully on-chain"
+    );
+    tracing::info!(
+        target: "kite_x402::audit",
+        event = "settlement_success",
+        uri = %resource_url,
+        tx = %settle.transaction,
+        network = %settle.network,
+        payer = ?settle.payer,
+        amount = ?settle.amount,
+        "Payment settlement audit: confirmed"
     );
     tracing::debug!(
         settle = ?settle,
