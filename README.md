@@ -33,6 +33,16 @@ failed upstream call never charges the buyer. See
 this template's behavior is a deliberate choice rather than a direct port:
 what happens when the facilitator itself can't be reached.
 
+## Rate Limiting
+
+The service includes an in-memory token-bucket rate limiter that guards `/v1/*` endpoints before payment verification:
+
+- `RATE_LIMIT_RPS`: Refill rate in requests per second (float, e.g. `100.0`; default `0` = disabled).
+- `RATE_LIMIT_BURST`: Maximum burst capacity (float, e.g. `50.0`; defaults to `RATE_LIMIT_RPS`).
+
+Clients exceeding the limit receive HTTP `429 Too Many Requests` with `Retry-After: <seconds>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, and `Cache-Control: no-store`. Rate-limited rejections are completely free and never contact the facilitator or upstream. Health checks (`/healthz`) are excluded from rate limits.
+
+
 ## Logging
 
 The service and library use [`tracing`](https://crates.io/crates/tracing) for structured diagnostic and protocol logging.

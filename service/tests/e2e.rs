@@ -1048,6 +1048,42 @@ fn refuses_to_start_when_the_port_is_already_taken() {
     assert!(stderr.contains("could not bind"), "{stderr}");
 }
 
+#[test]
+fn refuses_negative_rate_limit() {
+    let (status, stderr) = run_expecting_failure(vec![
+        ("PAY_TO", PAY_TO),
+        ("UPSTREAM_URL", "http://localhost:1"),
+        ("RATE_LIMIT_RPS", "-5"),
+        ("RUST_LOG", "off"),
+    ]);
+    assert!(!status.success());
+    assert!(
+        stderr.contains("RATE_LIMIT_RPS must be non-negative"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limiting_protects_service_without_charging() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("RATE_LIMIT_RPS".into(), "1".into()));
+    env.push(("RATE_LIMIT_BURST".into(), "1".into()));
+    let svc = Service::start(env).await;
+
+    // First request reaches gate / 402 challenge
+    let res1 = svc.get("/v1/test").await;
+    assert_eq!(res1.status(), 402);
+
+    // Second immediate request from same client is rate limited to 429
+    let res2 = svc.get("/v1/test").await;
+    assert_eq!(res2.status(), 429);
+    assert_eq!(res2.headers()["retry-after"], "1");
+    assert_eq!(res2.headers()["cache-control"], "no-store");
+    // Crucial: rate limit rejection happens before payment verification, zero facilitator calls
+    assert!(mocks.timeline().is_empty());
+}
+
 // ===========================================================================
 // shutdown
 // ===========================================================================
