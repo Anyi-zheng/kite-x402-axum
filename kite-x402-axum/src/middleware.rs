@@ -42,6 +42,8 @@ pub struct PaymentConfig {
     pub expiration_guard: Option<crate::expiration::ExpirationGuardConfig>,
     /// Optional metrics collector to track payment telemetry.
     pub metrics: Option<Arc<crate::metrics::PaymentMetrics>>,
+    /// Optional nonce replay guard to reject duplicate payment signatures before calling facilitator.
+    pub nonce_guard: Option<Arc<crate::nonce_guard::PaymentNonceReplayGuard>>,
 }
 
 impl PaymentConfig {
@@ -60,6 +62,7 @@ impl PaymentConfig {
             facilitator,
             expiration_guard: None,
             metrics: None,
+            nonce_guard: None,
         }
     }
 
@@ -73,6 +76,14 @@ impl PaymentConfig {
 
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::PaymentMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_nonce_guard(
+        mut self,
+        guard: Arc<crate::nonce_guard::PaymentNonceReplayGuard>,
+    ) -> Self {
+        self.nonce_guard = Some(guard);
         self
     }
 
@@ -296,6 +307,23 @@ pub async fn x402_payment(
                     );
                 }
             }
+        }
+    }
+
+    if let Some(guard) = &cfg.nonce_guard {
+        let key = guard.extract_nonce_key(&payload);
+        if let Err(e) = guard.check_and_record(&key) {
+            tracing::warn!(
+                uri = %resource_url,
+                error = %e,
+                "Payment authorization rejected by nonce replay guard; returning 402"
+            );
+            return payment_required_response(
+                requirements,
+                resource_url,
+                cfg.description.clone(),
+                Some(e.to_string()),
+            );
         }
     }
 
@@ -527,6 +555,7 @@ mod tests {
             facilitator: dead_facilitator(),
             expiration_guard: None,
             metrics: None,
+            nonce_guard: None,
         })
     }
 
@@ -914,5 +943,56 @@ mod tests {
         assert_eq!(snap.challenges_total, 1);
         assert_eq!(snap.verifications_success, 0);
         assert_eq!(snap.settlements_success, 0);
+    }
+
+    #[tokio::test]
+    async fn replayed_nonce_is_rejected_on_second_request() {
+        let guard = Arc::new(crate::nonce_guard::PaymentNonceReplayGuard::new(100, 60));
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_nonce_guard(guard),
+        );
+        let reqs = cfg.requirements().unwrap();
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: reqs,
+            payload: json!({
+                "authorization": {
+                    "nonce": "0xreplayed_nonce_123"
+                }
+            }),
+            extensions: None,
+        };
+        let encoded = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let (svc, reached) = gate(cfg);
+
+        // First attempt passes nonce guard, fails at facilitator (dead_facilitator => 402 with Facilitator unavailable)
+        let resp1 = svc
+            .clone()
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::PAYMENT_REQUIRED);
+        let header1 = decode_header(&resp1, "PAYMENT-REQUIRED");
+        assert!(!header1["error"].as_str().unwrap().contains("already been used"));
+
+        // Second attempt with exact same nonce is rejected by replay guard
+        let resp2 = svc
+            .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        let header2 = decode_header(&resp2, "PAYMENT-REQUIRED");
+        assert!(header2["error"].as_str().unwrap().contains("already been used"));
+    }
     }
 }
