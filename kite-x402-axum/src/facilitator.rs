@@ -811,11 +811,7 @@ mod tests {
 
     #[test]
     fn retry_config_calculates_exponential_backoff_and_caps_at_maximum() {
-        let config = RetryConfig::new(
-            3,
-            Duration::from_millis(50),
-            Duration::from_millis(300),
-        );
+        let config = RetryConfig::new(3, Duration::from_millis(50), Duration::from_millis(300));
         assert_eq!(config.calculate_backoff(0), Duration::from_millis(50));
         assert_eq!(config.calculate_backoff(1), Duration::from_millis(100));
         assert_eq!(config.calculate_backoff(2), Duration::from_millis(200));
@@ -852,7 +848,10 @@ mod tests {
         let retry = RetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50));
         let client = FacilitatorClient::new(&url).with_retry_config(retry);
 
-        let err = client.settle(&payload(), &requirements()).await.unwrap_err();
+        let err = client
+            .settle(&payload(), &requirements())
+            .await
+            .unwrap_err();
         match err {
             FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 400),
             other => panic!("expected BadResponse 400, got: {other:?}"),
@@ -868,7 +867,10 @@ mod tests {
         let retry = RetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50));
         let client = FacilitatorClient::new(&url).with_retry_config(retry);
 
-        let err = client.verify(&payload(), &requirements()).await.unwrap_err();
+        let err = client
+            .verify(&payload(), &requirements())
+            .await
+            .unwrap_err();
         match err {
             FacilitatorError::BadResponse { status, .. } => assert_eq!(status, 503),
             other => panic!("expected BadResponse 503, got: {other:?}"),

@@ -1726,7 +1726,10 @@ async fn replayed_payment_signature_is_rejected_on_second_request() {
         .unwrap();
     assert_eq!(resp2.status(), 402);
     let challenge = header_json(&resp2, "payment-required");
-    assert!(challenge["error"].as_str().unwrap().contains("already been used"));
+    assert!(challenge["error"]
+        .as_str()
+        .unwrap()
+        .contains("already been used"));
     assert_eq!(mocks.facilitator.verify_count(), 1);
 }
 
@@ -1831,7 +1834,6 @@ fn refuses_invalid_max_concurrent_requests() {
             "stderr should mention MAX_CONCURRENT_REQUESTS: {stderr}"
         );
     }
-
 }
 
 // Keep the import used on non-unix targets too.
