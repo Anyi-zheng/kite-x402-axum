@@ -86,11 +86,25 @@ async fn main() {
 
     let trusted_proxies = TrustedProxies::parse(&env_or("RATE_LIMIT_TRUSTED_PROXIES", ""))
         .unwrap_or_else(|message| panic!("{message}"));
+    let max_clients: usize = env_or("RATE_LIMIT_MAX_CLIENTS", "10000")
+        .parse()
+        .expect("RATE_LIMIT_MAX_CLIENTS must be an integer between 1 and 1000000");
+    if !(1..=1_000_000).contains(&max_clients) {
+        panic!("RATE_LIMIT_MAX_CLIENTS must be an integer between 1 and 1000000");
+    }
+    let idle_timeout_secs: u64 = env_or("RATE_LIMIT_IDLE_TIMEOUT_SECS", "300")
+        .parse()
+        .expect("RATE_LIMIT_IDLE_TIMEOUT_SECS must be an integer between 1 and 86400");
+    if !(1..=86_400).contains(&idle_timeout_secs) {
+        panic!("RATE_LIMIT_IDLE_TIMEOUT_SECS must be an integer between 1 and 86400");
+    }
     let rate_limiter: Arc<Option<TokenBucketRateLimiter>> = Arc::new(if rate_limit_rps > 0.0 {
         Some(TokenBucketRateLimiter::new(RateLimiterConfig {
             rps: rate_limit_rps,
             burst: rate_limit_burst.max(1.0),
             trusted_proxies,
+            max_clients,
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
         }))
     } else {
         None

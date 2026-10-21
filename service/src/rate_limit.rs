@@ -9,10 +9,10 @@ use axum::{
 };
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -124,48 +124,95 @@ pub(crate) struct RateLimiterConfig {
     pub rps: f64,
     pub burst: f64,
     pub trusted_proxies: TrustedProxies,
+    pub max_clients: usize,
+    pub idle_timeout: Duration,
 }
 
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
     last_refill: Instant,
+    expires_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct BucketStore {
+    clients: HashMap<IpAddr, Bucket>,
+    expirations: BTreeSet<(Instant, IpAddr)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RateLimitRejection {
+    Quota(u64),
+    Capacity,
 }
 
 #[derive(Debug)]
 pub(crate) struct TokenBucketRateLimiter {
     pub config: RateLimiterConfig,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    buckets: Mutex<BucketStore>,
 }
 
 impl TokenBucketRateLimiter {
     pub fn new(config: RateLimiterConfig) -> Self {
         Self {
             config,
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(BucketStore::default()),
         }
     }
 
-    pub fn acquire(&self, client_ip: IpAddr) -> Result<u64, u64> {
-        let mut buckets = self.buckets.lock().unwrap();
-        let now = Instant::now();
-        let bucket = buckets.entry(client_ip).or_insert_with(|| Bucket {
+    pub fn acquire(&self, client_ip: IpAddr, now: Instant) -> Result<u64, RateLimitRejection> {
+        let client_ip = normalize_ip(client_ip);
+        let mut store = self.buckets.lock().unwrap();
+        // Bound maintenance work as well as memory during a burst of new clients.
+        for _ in 0..64 {
+            match store.expirations.first().copied() {
+                Some((deadline, ip)) if deadline <= now => {
+                    store.expirations.pop_first();
+                    store.clients.remove(&ip);
+                }
+                _ => break,
+            }
+        }
+        if !store.clients.contains_key(&client_ip) && store.clients.len() >= self.config.max_clients
+        {
+            return Err(RateLimitRejection::Capacity);
+        }
+        let bucket = store.clients.entry(client_ip).or_insert_with(|| Bucket {
             tokens: self.config.burst,
             last_refill: now,
+            expires_at: None,
         });
-
+        // Concurrent callers can obtain timestamps in a different order than the lock.
+        let now = now.max(bucket.last_refill);
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.config.rps).min(self.config.burst);
         bucket.last_refill = now;
-
-        if bucket.tokens >= 1.0 {
+        let result = if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
             Ok(bucket.tokens as u64)
         } else {
             let needed = 1.0 - bucket.tokens;
             let wait_secs = (needed / self.config.rps).ceil() as u64;
-            Err(wait_secs.max(1))
+            Err(RateLimitRejection::Quota(wait_secs.max(1)))
+        };
+
+        let previous_expiry = bucket.expires_at;
+        // Expiring a depleted bucket would grant a fresh burst before natural refill.
+        // Unrepresentable deadlines stay cached, still subject to the capacity bound.
+        bucket.expires_at = Duration::try_from_secs_f64(
+            ((self.config.burst - bucket.tokens) / self.config.rps).ceil(),
+        )
+        .ok()
+        .and_then(|refill| now.checked_add(refill.max(self.config.idle_timeout)));
+        let expires_at = bucket.expires_at;
+        if let Some(previous_expiry) = previous_expiry {
+            store.expirations.remove(&(previous_expiry, client_ip));
         }
+        if let Some(expires_at) = expires_at {
+            store.expirations.insert((expires_at, client_ip));
+        }
+        result
     }
 }
 
@@ -195,7 +242,7 @@ pub(crate) async fn rate_limit_middleware(
             }
         };
 
-        match limiter.acquire(client_ip) {
+        match limiter.acquire(client_ip, Instant::now()) {
             Ok(remaining) => {
                 let mut response = next.run(req).await;
                 if let Ok(limit_val) = limiter.config.rps.to_string().parse() {
@@ -210,7 +257,13 @@ pub(crate) async fn rate_limit_middleware(
                 }
                 response
             }
-            Err(retry_after) => {
+            Err(RateLimitRejection::Capacity) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("cache-control", "no-store"), ("retry-after", "1")],
+                Json(json!({ "error": "rate_limit_capacity_exceeded" })),
+            )
+                .into_response(),
+            Err(RateLimitRejection::Quota(retry_after)) => {
                 tracing::warn!(client_ip = %client_ip, "Rate limit exceeded (429)");
                 let mut res = (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -251,6 +304,8 @@ mod tests {
             rps: 1.0,
             burst,
             trusted_proxies: TrustedProxies::default(),
+            max_clients: 10_000,
+            idle_timeout: Duration::from_secs(300),
         }
     }
 
@@ -396,10 +451,191 @@ mod tests {
     fn rate_limiter_allows_burst_and_keeps_clients_separate() {
         let limiter = TokenBucketRateLimiter::new(config(2.0));
         let ip = "192.0.2.1".parse().unwrap();
-        assert!(limiter.acquire(ip).is_ok());
-        assert!(limiter.acquire(ip).is_ok());
-        assert_eq!(limiter.acquire(ip), Err(1));
-        assert!(limiter.acquire("192.0.2.2".parse().unwrap()).is_ok());
+        let now = Instant::now();
+        assert_eq!(limiter.acquire(ip, now), Ok(1));
+        assert_eq!(limiter.acquire(ip, now), Ok(0));
+        assert_eq!(limiter.acquire(ip, now), Err(RateLimitRejection::Quota(1)));
+        assert_eq!(limiter.acquire(ip, now + Duration::from_secs(1)), Ok(0));
+        assert!(limiter.acquire("192.0.2.2".parse().unwrap(), now).is_ok());
+    }
+
+    #[test]
+    fn capacity_preserves_existing_quotas_and_recovers_after_idle_refill() {
+        let limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            max_clients: 1,
+            idle_timeout: Duration::from_secs(2),
+            ..config(1.0)
+        });
+        let now = Instant::now();
+        let first = "192.0.2.1".parse().unwrap();
+        let second = "192.0.2.2".parse().unwrap();
+        assert_eq!(limiter.acquire(first, now), Ok(0));
+        assert_eq!(
+            limiter.acquire(second, now),
+            Err(RateLimitRejection::Capacity)
+        );
+        assert_eq!(
+            limiter.acquire(first, now),
+            Err(RateLimitRejection::Quota(1))
+        );
+        assert_eq!(limiter.acquire(first, now + Duration::from_secs(1)), Ok(0));
+        assert_eq!(
+            limiter.acquire(second, now + Duration::from_secs(2)),
+            Err(RateLimitRejection::Capacity)
+        );
+        assert_eq!(limiter.acquire(second, now + Duration::from_secs(3)), Ok(0));
+        let store = limiter.buckets.lock().unwrap();
+        assert!(!store.clients.contains_key(&first));
+        assert_eq!(store.clients.len(), 1);
+        assert_eq!(store.expirations.len(), 1);
+    }
+
+    #[test]
+    fn idle_expiry_never_resets_a_slow_refilling_quota() {
+        let limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            rps: 0.1,
+            max_clients: 1,
+            idle_timeout: Duration::from_secs(1),
+            ..config(1.0)
+        });
+        let now = Instant::now();
+        let first = "192.0.2.1".parse().unwrap();
+        let second = "192.0.2.2".parse().unwrap();
+        assert_eq!(limiter.acquire(first, now), Ok(0));
+        assert_eq!(
+            limiter.acquire(second, now + Duration::from_secs(2)),
+            Err(RateLimitRejection::Capacity)
+        );
+        assert_eq!(
+            limiter.acquire(first, now + Duration::from_secs(2)),
+            Err(RateLimitRejection::Quota(8))
+        );
+        assert_eq!(
+            limiter.acquire(second, now + Duration::from_secs(10)),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn fractional_refill_and_out_of_order_timestamps_preserve_tokens() {
+        let limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            rps: 0.5,
+            ..config(1.0)
+        });
+        let now = Instant::now();
+        let ip = "192.0.2.1".parse().unwrap();
+        assert_eq!(limiter.acquire(ip, now), Ok(0));
+        assert_eq!(
+            limiter.acquire(ip, now + Duration::from_secs(1)),
+            Err(RateLimitRejection::Quota(1))
+        );
+        assert_eq!(limiter.acquire(ip, now), Err(RateLimitRejection::Quota(1)));
+        assert_eq!(limiter.acquire(ip, now + Duration::from_secs(2)), Ok(0));
+    }
+
+    #[test]
+    fn hot_clients_do_not_grow_the_expiry_index() {
+        let limiter = TokenBucketRateLimiter::new(config(1.0));
+        let now = Instant::now();
+        for millis in 0..10_000 {
+            let _ = limiter.acquire(
+                "192.0.2.1".parse().unwrap(),
+                now + Duration::from_millis(millis),
+            );
+            let store = limiter.buckets.lock().unwrap();
+            assert_eq!(store.clients.len(), 1);
+            assert_eq!(store.expirations.len(), 1);
+        }
+    }
+
+    #[test]
+    fn unrepresentable_refill_deadlines_remain_bounded_without_panicking() {
+        let limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            rps: f64::MIN_POSITIVE,
+            max_clients: 1,
+            ..config(1.0)
+        });
+        let now = Instant::now();
+        let first = "192.0.2.1".parse().unwrap();
+        assert_eq!(limiter.acquire(first, now), Ok(0));
+        assert_eq!(
+            limiter.acquire(first, now),
+            Err(RateLimitRejection::Quota(u64::MAX))
+        );
+        assert_eq!(
+            limiter.acquire("192.0.2.2".parse().unwrap(), now),
+            Err(RateLimitRejection::Capacity)
+        );
+        let store = limiter.buckets.lock().unwrap();
+        assert_eq!(store.clients.len(), 1);
+        assert!(store.expirations.is_empty());
+    }
+
+    #[test]
+    fn cleanup_is_bounded_and_eventually_reclaims_all_expired_clients() {
+        let limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            max_clients: 130,
+            idle_timeout: Duration::from_secs(1),
+            ..config(1.0)
+        });
+        let now = Instant::now();
+        for last_octet in 1..=130 {
+            assert!(limiter
+                .acquire(IpAddr::from([192, 0, 2, last_octet]), now)
+                .is_ok());
+        }
+        let later = now + Duration::from_secs(1);
+        let ip = "198.51.100.1".parse().unwrap();
+        assert!(limiter.acquire(ip, later).is_ok());
+        assert_eq!(limiter.buckets.lock().unwrap().clients.len(), 67);
+        assert!(limiter.acquire(ip, later).is_err());
+        assert_eq!(limiter.buckets.lock().unwrap().clients.len(), 3);
+        assert!(limiter.acquire(ip, later).is_err());
+        let store = limiter.buckets.lock().unwrap();
+        assert_eq!(store.clients.len(), 1);
+        assert_eq!(store.expirations.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_requests_share_one_burst_and_respect_capacity() {
+        let limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            max_clients: 3,
+            ..config(5.0)
+        });
+        let now = Instant::now();
+        let ip = "192.0.2.1".parse().unwrap();
+        let admitted: usize = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..32)
+                .map(|_| scope.spawn(|| limiter.acquire(ip, now).is_ok()))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum()
+        });
+        assert_eq!(admitted, 5);
+        std::thread::scope(|scope| {
+            for last_octet in 2..=32 {
+                let limiter = &limiter;
+                scope.spawn(move || {
+                    let _ = limiter.acquire(IpAddr::from([192, 0, 2, last_octet]), now);
+                });
+            }
+        });
+        let store = limiter.buckets.lock().unwrap();
+        assert_eq!(store.clients.len(), 3);
+        assert_eq!(store.expirations.len(), 3);
+    }
+
+    #[test]
+    fn ipv4_mapped_peers_share_the_ipv4_quota() {
+        let limiter = TokenBucketRateLimiter::new(config(1.0));
+        let now = Instant::now();
+        assert_eq!(limiter.acquire("192.0.2.1".parse().unwrap(), now), Ok(0));
+        assert_eq!(
+            limiter.acquire("::ffff:192.0.2.1".parse().unwrap(), now),
+            Err(RateLimitRejection::Quota(1))
+        );
     }
 
     #[tokio::test]

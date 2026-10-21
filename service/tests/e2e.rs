@@ -1214,6 +1214,122 @@ fn refuses_invalid_trusted_proxy_configuration() {
 }
 
 #[test]
+fn refuses_invalid_rate_limit_cache_configuration() {
+    for (key, values) in [
+        (
+            "RATE_LIMIT_MAX_CLIENTS",
+            ["0", "-1", "1000001", "NaN", "1.5"],
+        ),
+        (
+            "RATE_LIMIT_IDLE_TIMEOUT_SECS",
+            ["0", "-1", "86401", "inf", "1.5"],
+        ),
+    ] {
+        for value in values {
+            let (status, stderr) = run_expecting_failure(vec![
+                ("PAY_TO", PAY_TO),
+                ("UPSTREAM_URL", "http://localhost:1"),
+                (key, value),
+                ("RUST_LOG", "off"),
+            ]);
+            assert!(!status.success(), "{key}={value} must fail startup");
+            assert!(stderr.contains(key), "{key}={value}: {stderr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_capacity_rejects_new_clients_before_payment_work() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+        ("RATE_LIMIT_MAX_CLIENTS".into(), "1".into()),
+        ("RATE_LIMIT_IDLE_TIMEOUT_SECS".into(), "1".into()),
+        ("RATE_LIMIT_TRUSTED_PROXIES".into(), "127.0.0.1".into()),
+    ]);
+    let svc = Service::start(env).await;
+    let challenge = svc
+        .http
+        .get(svc.url("/v1/test"))
+        .header("x-forwarded-for", "192.0.2.1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), 402);
+    let requirements =
+        serde_json::from_value(header_json(&challenge, "payment-required")["accepts"][0].clone())
+            .unwrap();
+    let payment = payment_header(&requirements);
+    for (ip, status, error) in [
+        ("192.0.2.1", 429, "rate_limit_exceeded"),
+        ("192.0.2.2", 503, "rate_limit_capacity_exceeded"),
+    ] {
+        let response = svc
+            .http
+            .get(svc.url("/v1/test"))
+            .header("x-forwarded-for", ip)
+            .header("payment-signature", &payment)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(response.headers().contains_key("retry-after"));
+        assert_eq!(response.json::<Value>().await.unwrap()["error"], error);
+    }
+    for path in ["/healthz", "/livez", "/metrics"] {
+        assert_eq!(svc.get(path).await.status(), 200);
+    }
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn rate_limit_capacity_recovers_after_idle_clients_expire() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "10".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+        ("RATE_LIMIT_MAX_CLIENTS".into(), "1".into()),
+        ("RATE_LIMIT_IDLE_TIMEOUT_SECS".into(), "1".into()),
+        ("RATE_LIMIT_TRUSTED_PROXIES".into(), "127.0.0.1".into()),
+    ]);
+    let svc = Service::start(env).await;
+    assert_eq!(
+        svc.http
+            .get(svc.url("/v1/test"))
+            .header("x-forwarded-for", "192.0.2.1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        402
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed_capacity = false;
+    loop {
+        let response = svc
+            .http
+            .get(svc.url("/v1/test"))
+            .header("x-forwarded-for", "192.0.2.2")
+            .send()
+            .await
+            .unwrap();
+        match response.status().as_u16() {
+            402 => break,
+            503 => observed_capacity = true,
+            status => panic!("unexpected status: {status}"),
+        }
+        assert!(Instant::now() < deadline, "idle client was not reclaimed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(observed_capacity);
+    assert!(mocks.timeline().is_empty());
+}
+
+#[test]
 fn refuses_invalid_timeout_configurations() {
     let (status, stderr) = run_expecting_failure(vec![
         ("PAY_TO", PAY_TO),
