@@ -1091,6 +1091,25 @@ fn refuses_negative_rate_limit() {
     );
 }
 
+#[test]
+fn refuses_negative_and_non_finite_rate_limits() {
+    for key in ["RATE_LIMIT_RPS", "RATE_LIMIT_BURST"] {
+        for value in ["-5", "NaN", "inf", "-inf", "1e999"] {
+            let (status, stderr) = run_expecting_failure(vec![
+                ("PAY_TO", PAY_TO),
+                ("UPSTREAM_URL", "http://localhost:1"),
+                (key, value),
+                ("RUST_LOG", "off"),
+            ]);
+            assert!(!status.success(), "{key}={value} must fail startup");
+            assert!(
+                stderr.contains(&format!("{key} must be a finite non-negative number")),
+                "{key}={value}: {stderr}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn rate_limiting_protects_service_without_charging() {
     let mocks = Mocks::start().await;
@@ -1109,6 +1128,219 @@ async fn rate_limiting_protects_service_without_charging() {
     assert_eq!(res2.headers()["retry-after"], "1");
     assert_eq!(res2.headers()["cache-control"], "no-store");
     // Crucial: rate limit rejection happens before payment verification, zero facilitator calls
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn untrusted_forwarding_headers_cannot_reset_rate_limits() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+    ]);
+    let svc = Service::start(env).await;
+    assert_eq!(svc.get("/v1/test").await.status(), 402);
+    for (name, value) in [
+        ("X-Forwarded-For", "192.0.2.1"),
+        ("X-Forwarded-For", "192.0.2.2"),
+        ("X-Real-IP", "203.0.113.1"),
+        ("X-Forwarded-For", "invalid"),
+    ] {
+        assert_eq!(
+            svc.http
+                .get(svc.url("/v1/test"))
+                .header(name, value)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            429
+        );
+    }
+    assert_eq!(svc.get("/healthz").await.status(), 200);
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn trusted_proxy_chains_keep_client_quotas_isolated() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+        ("RATE_LIMIT_TRUSTED_PROXIES".into(), "127.0.0.0/8".into()),
+    ]);
+    let svc = Service::start(env).await;
+    for (value, status) in [
+        ("192.0.2.1, 198.51.100.1, 127.0.0.2", 402),
+        ("192.0.2.2, 198.51.100.1, 127.0.0.2", 429),
+        ("198.51.100.2, 127.0.0.2", 402),
+        ("198.51.100.3, bad", 400),
+    ] {
+        assert_eq!(
+            svc.http
+                .get(svc.url("/v1/test"))
+                .header("X-Forwarded-For", value)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            status,
+            "{value}"
+        );
+    }
+    assert_eq!(
+        svc.http
+            .get(svc.url("/v1/test"))
+            .header("X-Real-IP", "198.51.100.3")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        402
+    );
+    assert_eq!(
+        svc.http
+            .get(svc.url("/v1/test"))
+            .header("X-Forwarded-For", "198.51.100.3")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        429
+    );
+    assert!(mocks.timeline().is_empty());
+}
+
+#[test]
+fn refuses_invalid_trusted_proxy_configuration() {
+    for value in ["*", "127.0.0.1/33", "::/129", "127.0.0.1,", "not-an-ip"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("RATE_LIMIT_TRUSTED_PROXIES", value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success());
+        assert!(stderr.contains("RATE_LIMIT_TRUSTED_PROXIES"), "{stderr}");
+    }
+}
+
+#[test]
+fn refuses_invalid_rate_limit_cache_configuration() {
+    for (key, values) in [
+        (
+            "RATE_LIMIT_MAX_CLIENTS",
+            ["0", "-1", "1000001", "NaN", "1.5"],
+        ),
+        (
+            "RATE_LIMIT_IDLE_TIMEOUT_SECS",
+            ["0", "-1", "86401", "inf", "1.5"],
+        ),
+    ] {
+        for value in values {
+            let (status, stderr) = run_expecting_failure(vec![
+                ("PAY_TO", PAY_TO),
+                ("UPSTREAM_URL", "http://localhost:1"),
+                (key, value),
+                ("RUST_LOG", "off"),
+            ]);
+            assert!(!status.success(), "{key}={value} must fail startup");
+            assert!(stderr.contains(key), "{key}={value}: {stderr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_capacity_rejects_new_clients_before_payment_work() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+        ("RATE_LIMIT_MAX_CLIENTS".into(), "1".into()),
+        ("RATE_LIMIT_IDLE_TIMEOUT_SECS".into(), "1".into()),
+        ("RATE_LIMIT_TRUSTED_PROXIES".into(), "127.0.0.1".into()),
+    ]);
+    let svc = Service::start(env).await;
+    let challenge = svc
+        .http
+        .get(svc.url("/v1/test"))
+        .header("x-forwarded-for", "192.0.2.1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), 402);
+    let requirements =
+        serde_json::from_value(header_json(&challenge, "payment-required")["accepts"][0].clone())
+            .unwrap();
+    let payment = payment_header(&requirements);
+    for (ip, status, error) in [
+        ("192.0.2.1", 429, "rate_limit_exceeded"),
+        ("192.0.2.2", 503, "rate_limit_capacity_exceeded"),
+    ] {
+        let response = svc
+            .http
+            .get(svc.url("/v1/test"))
+            .header("x-forwarded-for", ip)
+            .header("payment-signature", &payment)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(response.headers().contains_key("retry-after"));
+        assert_eq!(response.json::<Value>().await.unwrap()["error"], error);
+    }
+    for path in ["/healthz", "/livez", "/metrics"] {
+        assert_eq!(svc.get(path).await.status(), 200);
+    }
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn rate_limit_capacity_recovers_after_idle_clients_expire() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "10".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+        ("RATE_LIMIT_MAX_CLIENTS".into(), "1".into()),
+        ("RATE_LIMIT_IDLE_TIMEOUT_SECS".into(), "1".into()),
+        ("RATE_LIMIT_TRUSTED_PROXIES".into(), "127.0.0.1".into()),
+    ]);
+    let svc = Service::start(env).await;
+    assert_eq!(
+        svc.http
+            .get(svc.url("/v1/test"))
+            .header("x-forwarded-for", "192.0.2.1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        402
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed_capacity = false;
+    loop {
+        let response = svc
+            .http
+            .get(svc.url("/v1/test"))
+            .header("x-forwarded-for", "192.0.2.2")
+            .send()
+            .await
+            .unwrap();
+        match response.status().as_u16() {
+            402 => break,
+            503 => observed_capacity = true,
+            status => panic!("unexpected status: {status}"),
+        }
+        assert!(Instant::now() < deadline, "idle client was not reclaimed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(observed_capacity);
     assert!(mocks.timeline().is_empty());
 }
 
