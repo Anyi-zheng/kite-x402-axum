@@ -57,6 +57,24 @@ RUST_LOG=kite_x402_service=debug,kite_x402_axum=debug cargo run
 - **Log fields**: Request diagnostics use `header_names`; response diagnostics use `response_header_names`. These replace the previous `headers` and `response_headers` fields containing full header maps. Method, URI, request ID, status, and latency remain available. This protection applies to HTTP header diagnostics; it does not sanitize URIs or facilitator response bodies logged elsewhere.
 - **`X-Request-Id` tracing**: Every request receives an `x-request-id` correlation identifier (echoing incoming alphanumeric headers or generating a unique `req-<timestamp>-<counter>` identifier). The request ID is attached to all outbound responses (including 402 challenges and error responses) and forwarded to the upstream API. Its value is logged separately as `request_id` for correlation.
 
+## Security headers
+
+The service wraps all responses (including `/healthz`, `/v1/*`, and 402 payment challenge responses) with defensive HTTP security headers to protect clients and webviews against MIME-sniffing, clickjacking, and XSS:
+
+| Header | Default Value | Description |
+| --- | --- | --- |
+| `X-Content-Type-Options` | `nosniff` | Blocks MIME-type sniffing |
+| `X-Frame-Options` | `DENY` | Prevents iframe embedding / clickjacking |
+| `X-XSS-Protection` | `0` | Disables legacy buggy XSS auditor |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Protects referrer leakage across origins |
+| `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'` | Restricts executable resource loading |
+
+Security headers are enabled by default and can be configured via environment variables:
+- `SECURITY_HEADERS_ENABLED=false` to disable the middleware.
+- `SECURITY_CSP="..."` to override the default Content-Security-Policy.
+- `SECURITY_REFERRER_POLICY="..."` to configure a custom Referrer-Policy.
+
+
 ## Error Responses
 
 The service emits structured JSON error bodies:
