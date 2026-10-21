@@ -197,6 +197,50 @@ impl FacilitatorClient {
         payload: &PaymentPayload,
         requirements: &PaymentRequirements,
     ) -> Result<T, FacilitatorError> {
+        let max_retries = if op == "settle" {
+            self.retry_config.max_retries
+        } else {
+            0
+        };
+
+        let mut attempt = 0;
+        loop {
+            match self.send_single(op, payload, requirements).await {
+                Ok(resp) => return Ok(resp),
+                Err(err) => {
+                    let is_transient = match &err {
+                        FacilitatorError::Request(_) => true,
+                        FacilitatorError::BadResponse { status, .. } => {
+                            *status >= 500 && *status < 600
+                        }
+                    };
+
+                    if attempt < max_retries && is_transient {
+                        let backoff = self.retry_config.calculate_backoff(attempt);
+                        tracing::warn!(
+                            op = %op,
+                            attempt = attempt + 1,
+                            max_retries = max_retries,
+                            backoff_ms = backoff.as_millis(),
+                            error = %err,
+                            "Transient facilitator failure, retrying with backoff"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_single<T: serde::de::DeserializeOwned>(
+        &self,
+        op: &'static str,
+        payload: &PaymentPayload,
+        requirements: &PaymentRequirements,
+    ) -> Result<T, FacilitatorError> {
         let body = FacilitatorRequest {
             x402_version: payload.x402_version,
             payment_payload: payload,
