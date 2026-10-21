@@ -1509,6 +1509,7 @@ async fn replayed_payment_signature_is_rejected_on_second_request() {
     assert_eq!(mocks.facilitator.verify_count(), 1);
 }
 
+#[tokio::test]
 async fn concurrency_overflow_rejects_with_503_before_payment_and_releases_after() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
