@@ -17,7 +17,7 @@ use axum::{
     Json, Router,
 };
 use kite_x402_axum::{
-    facilitator::FacilitatorClient,
+    facilitator::{FacilitatorClient, RetryConfig},
     kite::{kite_chain_by_name, FACILITATOR_URL},
     middleware::{x402_payment, PaymentConfig},
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
@@ -59,6 +59,19 @@ async fn main() {
     let description = env_or("SERVICE_DESCRIPTION", "Paid API access via Kite x402");
     let upstream_auth_header = env_or("UPSTREAM_AUTH_HEADER", "Authorization");
     let upstream_auth_value = env_or("UPSTREAM_AUTH_VALUE", "");
+    let settle_retries: u32 = env_or("FACILITATOR_SETTLE_RETRIES", "2")
+        .parse()
+        .unwrap_or(2);
+    let settle_backoff_ms: u64 = env_or("FACILITATOR_SETTLE_BACKOFF_MS", "150")
+        .parse()
+        .unwrap_or(150);
+
+    let retry_cfg = RetryConfig::new(
+        settle_retries,
+        Duration::from_millis(settle_backoff_ms),
+        Duration::from_secs(3),
+    );
+
     let cors_origin = env_or("CORS_ORIGIN", "");
     let cors_cfg = Arc::new(CorsConfig::from_env(Some(&cors_origin)));
 
@@ -97,7 +110,7 @@ async fn main() {
         chain,
         price_usd,
         description,
-        facilitator: FacilitatorClient::new(facilitator_url),
+        facilitator: FacilitatorClient::new(facilitator_url).with_retry_config(retry_cfg),
         expiration_guard,
         metrics: Some(Arc::clone(&metrics)),
     });
