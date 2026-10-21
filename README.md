@@ -42,6 +42,34 @@ The service includes an in-memory token-bucket rate limiter that guards `/v1/*` 
 
 Clients exceeding the limit receive HTTP `429 Too Many Requests` with `Retry-After: <seconds>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, and `Cache-Control: no-store`. Rate-limited rejections are completely free and never contact the facilitator or upstream. Health checks (`/healthz`) are excluded from rate limits.
 
+## Health, Liveness & Diagnostics
+
+The service exposes endpoints outside `/v1/*` that are unmetered (free) and never invoke payment verification or settlement:
+
+- **`GET /healthz`**: Standard readiness check; returns `{"status": "ok"}` when the HTTP listener is operational.
+- **`GET /livez`**: Liveness probe; returns `{"status": "ok", "uptime_seconds": ...}`.
+- **`GET /metrics`**: Operational diagnostics; returns a JSON snapshot of atomic counters:
+  - `total_requests`: Lifetime total requests received.
+  - `active_requests`: Currently in-flight concurrent requests.
+  - `paid_challenges`: Count of `402 Payment Required` challenges issued.
+  - `successful_requests`: Requests returning status < 400.
+  - `server_errors`: Requests returning status >= 500.
+  - `uptime_seconds`: Seconds elapsed since service startup.
+
+## Timeouts & Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PAY_TO` | Required | Receiving wallet address on Kite. |
+| `UPSTREAM_URL` | Required | Protected upstream origin URL. |
+| `KITE_NETWORK` | `mainnet` | `mainnet` or `testnet`. |
+| `PRICE_USD` | `0.001` | Price per call in USD. |
+| `PORT` | `8402` | Port for the reverse proxy service. |
+| `FACILITATOR_URL` | `https://facilitator.pieverse.io/v2` | Kite facilitator URL (retaining `/v2`). |
+| `UPSTREAM_TIMEOUT_MS` | `10000` | Upstream request timeout in milliseconds (100..=300000). |
+| `FACILITATOR_TIMEOUT_MS` | `30000` | Facilitator verification/settlement timeout in milliseconds (100..=300000). |
+| `UPSTREAM_AUTH_HEADER` | `Authorization` | Credential header injected into upstream calls. |
+| `UPSTREAM_AUTH_VALUE` | Empty | Upstream secret credential (redacted from logs). |
 
 ## Logging
 

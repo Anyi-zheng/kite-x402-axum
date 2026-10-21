@@ -523,6 +523,34 @@ async fn healthz_is_free_and_never_contacts_the_backends() {
 }
 
 #[tokio::test]
+async fn livez_is_free_and_reports_uptime() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    let resp = svc.get("/livez").await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(body["uptime_seconds"].as_u64().is_some());
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn metrics_is_free_and_reports_real_activity() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    let resp = svc.get("/metrics").await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(body["total_requests"].as_u64().unwrap() >= 2);
+    assert!(body["successful_requests"].as_u64().unwrap() >= 1);
+    assert_eq!(body["server_errors"], 0);
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
 async fn readyz_probes_facilitator_and_returns_status() {
     let mocks = Mocks::start().await;
     let svc = Service::start_with(&mocks).await;
@@ -1049,6 +1077,7 @@ fn refuses_to_start_when_the_port_is_already_taken() {
 }
 
 #[test]
+#[test]
 fn refuses_negative_rate_limit() {
     let (status, stderr) = run_expecting_failure(vec![
         ("PAY_TO", PAY_TO),
@@ -1084,6 +1113,32 @@ async fn rate_limiting_protects_service_without_charging() {
     assert!(mocks.timeline().is_empty());
 }
 
+#[test]
+fn refuses_invalid_timeout_configurations() {
+    let (status, stderr) = run_expecting_failure(vec![
+        ("PAY_TO", PAY_TO),
+        ("UPSTREAM_URL", "http://localhost:1"),
+        ("UPSTREAM_TIMEOUT_MS", "50"),
+        ("RUST_LOG", "off"),
+    ]);
+    assert!(!status.success());
+    assert!(
+        stderr.contains("UPSTREAM_TIMEOUT_MS must be between 100 and 300000 ms"),
+        "{stderr}"
+    );
+
+    let (status2, stderr2) = run_expecting_failure(vec![
+        ("PAY_TO", PAY_TO),
+        ("UPSTREAM_URL", "http://localhost:1"),
+        ("FACILITATOR_TIMEOUT_MS", "500000"),
+        ("RUST_LOG", "off"),
+    ]);
+    assert!(!status2.success());
+    assert!(
+        stderr2.contains("FACILITATOR_TIMEOUT_MS must be between 100 and 300000 ms"),
+        "{stderr2}"
+    );
+}
 // ===========================================================================
 // shutdown
 // ===========================================================================

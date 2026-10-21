@@ -9,7 +9,10 @@
 use std::{
     collections::HashMap,
     env,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -86,6 +89,18 @@ async fn main() {
         None
     });
 
+    let upstream_timeout_ms: u64 = env_or("UPSTREAM_TIMEOUT_MS", "10000")
+        .parse()
+        .expect("UPSTREAM_TIMEOUT_MS must be a number");
+    if !(100..=300000).contains(&upstream_timeout_ms) {
+        panic!("UPSTREAM_TIMEOUT_MS must be between 100 and 300000 ms");
+    }
+    let facilitator_timeout_ms: u64 = env_or("FACILITATOR_TIMEOUT_MS", "30000")
+        .parse()
+        .expect("FACILITATOR_TIMEOUT_MS must be a number");
+    if !(100..=300000).contains(&facilitator_timeout_ms) {
+        panic!("FACILITATOR_TIMEOUT_MS must be between 100 and 300000 ms");
+    }
     let settle_retries: u32 = env_or("FACILITATOR_SETTLE_RETRIES", "2")
         .parse()
         .unwrap_or(2);
@@ -113,6 +128,8 @@ async fn main() {
         facilitator_url = %facilitator_url,
         rate_limit_rps = rate_limit_rps,
         rate_limit_burst = rate_limit_burst,
+        upstream_timeout_ms = upstream_timeout_ms,
+        facilitator_timeout_ms = facilitator_timeout_ms,
         cors_origin = %cors_origin,
         cors_enabled = cors_cfg.is_enabled(),
         auth_injected = !upstream_auth_value.is_empty(),
@@ -122,7 +139,7 @@ async fn main() {
     // Never follow a redirect to another host: the injected upstream
     // credential would go with it. See `same_origin_redirect_policy`.
     let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_millis(upstream_timeout_ms))
         .redirect(same_origin_redirect_policy())
         .build()
         .expect("reqwest client");
@@ -139,7 +156,11 @@ async fn main() {
         chain,
         price_usd,
         description,
-        facilitator: FacilitatorClient::new(facilitator_url).with_retry_config(retry_cfg),
+        facilitator: FacilitatorClient::with_timeout(
+            facilitator_url,
+            Duration::from_millis(facilitator_timeout_ms),
+        )
+        .with_retry_config(retry_cfg),
         expiration_guard,
         metrics: Some(Arc::clone(&metrics)),
     });
@@ -164,9 +185,16 @@ async fn main() {
             rate_limit_middleware,
         ));
 
+    let service_metrics = Arc::new(ServiceMetrics::new());
+
     let metrics_router = Router::new()
         .route("/metrics/x402", axum::routing::get(metrics_x402_handler))
         .with_state(Arc::clone(&metrics));
+
+    let diag_router = Router::new()
+        .route("/livez", axum::routing::get(livez))
+        .route("/metrics", axum::routing::get(metrics_endpoint))
+        .with_state(Arc::clone(&service_metrics));
 
     let security_enabled = match env::var("SECURITY_HEADERS_ENABLED") {
         Ok(v) => v.trim() != "0" && !v.trim().eq_ignore_ascii_case("false"),
@@ -196,13 +224,17 @@ async fn main() {
             axum::routing::get(readyz).with_state(payment_cfg),
         )
         .merge(metrics_router)
+        .merge(diag_router)
         .nest("/v1", paid)
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             security_cfg,
             security_headers_middleware,
         ))
-        .layer(middleware::from_fn(http_request_logger));
+        .layer(middleware::from_fn_with_state(
+            service_metrics.clone(),
+            http_request_logger,
+        ));
 
     if cors_cfg.is_enabled() {
         app = app.layer(middleware::from_fn_with_state(cors_cfg, cors_middleware));
@@ -261,7 +293,70 @@ async fn metrics_x402_handler(
     Json(metrics.snapshot())
 }
 
-async fn http_request_logger(mut req: Request, next: Next) -> Response {
+#[derive(Debug)]
+pub struct ServiceMetrics {
+    start_time: Instant,
+    total_requests: AtomicU64,
+    paid_challenges: AtomicU64,
+    successful_requests: AtomicU64,
+    server_errors: AtomicU64,
+    active_requests: AtomicI64,
+}
+
+impl Default for ServiceMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceMetrics {
+    pub fn new() -> Self {
+        Self {
+            start_time: Instant::now(),
+            total_requests: AtomicU64::new(0),
+            paid_challenges: AtomicU64::new(0),
+            successful_requests: AtomicU64::new(0),
+            server_errors: AtomicU64::new(0),
+            active_requests: AtomicI64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        json!({
+            "status": "ok",
+            "uptime_seconds": self.start_time.elapsed().as_secs(),
+            "total_requests": self.total_requests.load(Ordering::SeqCst),
+            "active_requests": self.active_requests.load(Ordering::SeqCst).max(0),
+            "paid_challenges": self.paid_challenges.load(Ordering::SeqCst),
+            "successful_requests": self.successful_requests.load(Ordering::SeqCst),
+            "server_errors": self.server_errors.load(Ordering::SeqCst),
+        })
+    }
+}
+
+pub struct ActiveRequestGuard(Arc<ServiceMetrics>);
+
+impl ActiveRequestGuard {
+    pub fn new(metrics: Arc<ServiceMetrics>) -> Self {
+        metrics.active_requests.fetch_add(1, Ordering::SeqCst);
+        Self(metrics)
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.active_requests.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn http_request_logger(
+    State(metrics): State<Arc<ServiceMetrics>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let _guard = ActiveRequestGuard::new(metrics.clone());
+    metrics.total_requests.fetch_add(1, Ordering::SeqCst);
+
     let start = std::time::Instant::now();
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -299,6 +394,7 @@ async fn http_request_logger(mut req: Request, next: Next) -> Response {
     let status = response.status();
 
     if status.is_server_error() {
+        metrics.server_errors.fetch_add(1, Ordering::SeqCst);
         tracing::error!(
             request_id = %request_id,
             method = %method,
@@ -308,6 +404,7 @@ async fn http_request_logger(mut req: Request, next: Next) -> Response {
             "<-- HTTP request failed (server error)"
         );
     } else if status == StatusCode::PAYMENT_REQUIRED {
+        metrics.paid_challenges.fetch_add(1, Ordering::SeqCst);
         tracing::info!(
             request_id = %request_id,
             method = %method,
@@ -326,6 +423,7 @@ async fn http_request_logger(mut req: Request, next: Next) -> Response {
             "<-- HTTP request client error"
         );
     } else {
+        metrics.successful_requests.fetch_add(1, Ordering::SeqCst);
         tracing::info!(
             request_id = %request_id,
             method = %method,
@@ -515,6 +613,19 @@ async fn rate_limit_middleware(
     }
 }
 
+async fn livez(State(metrics): State<Arc<ServiceMetrics>>) -> Json<serde_json::Value> {
+    tracing::debug!("Handling /livez request");
+    Json(json!({
+        "status": "ok",
+        "uptime_seconds": metrics.start_time.elapsed().as_secs(),
+    }))
+}
+
+async fn metrics_endpoint(State(metrics): State<Arc<ServiceMetrics>>) -> Json<serde_json::Value> {
+    tracing::debug!("Handling /metrics request");
+    Json(metrics.snapshot())
+}
+
 async fn healthz() -> Json<serde_json::Value> {
     tracing::debug!("Handling /healthz request");
     Json(json!({ "status": "ok" }))
@@ -587,9 +698,10 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_ok() {
+        let metrics = Arc::new(ServiceMetrics::new());
         let app = Router::new()
             .route("/healthz", get(healthz))
-            .layer(middleware::from_fn(http_request_logger));
+            .layer(middleware::from_fn_with_state(metrics, http_request_logger));
 
         let res = app
             .oneshot(
@@ -606,9 +718,10 @@ mod tests {
 
     #[tokio::test]
     async fn logger_handles_404() {
+        let metrics = Arc::new(ServiceMetrics::new());
         let app = Router::new()
             .route("/healthz", get(healthz))
-            .layer(middleware::from_fn(http_request_logger));
+            .layer(middleware::from_fn_with_state(metrics, http_request_logger));
 
         let res = app
             .oneshot(
@@ -656,12 +769,13 @@ mod tests {
     #[tokio::test]
     async fn logger_passes_every_status_class_through_unchanged() {
         for status in [200u16, 204, 302, 402, 404, 500, 503] {
+            let metrics = Arc::new(ServiceMetrics::new());
             let app = Router::new()
                 .route(
                     "/s",
                     get(move || async move { StatusCode::from_u16(status).unwrap() }),
                 )
-                .layer(middleware::from_fn(http_request_logger));
+                .layer(middleware::from_fn_with_state(metrics, http_request_logger));
             let res = app
                 .oneshot(Request::builder().uri("/s").body(Body::empty()).unwrap())
                 .await
@@ -672,9 +786,10 @@ mod tests {
 
     #[tokio::test]
     async fn logger_does_not_alter_headers_or_body() {
+        let metrics = Arc::new(ServiceMetrics::new());
         let app = Router::new()
             .route("/h", get(|| async { ([("x-thing", "1")], "payload") }))
-            .layer(middleware::from_fn(http_request_logger));
+            .layer(middleware::from_fn_with_state(metrics, http_request_logger));
         let res = app
             .oneshot(Request::builder().uri("/h").body(Body::empty()).unwrap())
             .await
@@ -690,6 +805,66 @@ mod tests {
     async fn healthz_body_is_status_ok_json() {
         let Json(v) = healthz().await;
         assert_eq!(v, json!({ "status": "ok" }));
+    }
+
+    #[tokio::test]
+    async fn livez_body_contains_ok_and_uptime() {
+        let metrics = Arc::new(ServiceMetrics::new());
+        let Json(v) = livez(State(metrics)).await;
+        assert_eq!(v["status"], "ok");
+        assert!(v["uptime_seconds"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_tracks_and_reports_requests() {
+        let metrics = Arc::new(ServiceMetrics::new());
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/metrics", get(metrics_endpoint))
+            .with_state(metrics.clone())
+            .layer(middleware::from_fn_with_state(
+                metrics.clone(),
+                http_request_logger,
+            ));
+
+        // Initial snapshot
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["total_requests"], 1);
+        assert_eq!(body["active_requests"], 1);
+
+        // Another request to /healthz
+        let res2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+
+        let Json(snapshot) = metrics_endpoint(State(metrics.clone())).await;
+        assert_eq!(snapshot["total_requests"], 2);
+        assert_eq!(snapshot["successful_requests"], 2);
+        assert_eq!(metrics.active_requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
