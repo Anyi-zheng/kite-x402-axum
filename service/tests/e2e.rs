@@ -1539,6 +1539,65 @@ async fn replay_guard_retries_known_failures_and_blocks_completed_payments() {
     assert_eq!(mocks.facilitator.settle_count(), 1);
 }
 
+#[test]
+fn refuses_invalid_replay_cache_configuration() {
+    for value in ["0", "-1", "1000001", "NaN", "1.5", "18446744073709551616"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("PAYMENT_REPLAY_CACHE_SIZE", value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success(), "PAYMENT_REPLAY_CACHE_SIZE={value}");
+        assert!(
+            stderr.contains("PAYMENT_REPLAY_CACHE_SIZE must be an integer between 1 and 1000000"),
+            "{stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn blank_replay_configuration_keeps_protection_disabled() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("PAYMENT_REPLAY_CACHE_SIZE".into(), "  ".into()));
+    let svc = Service::start(env).await;
+    let payment = payment_header(&svc.requirements("/v1/items").await);
+    for _ in 0..2 {
+        let response = svc
+            .http
+            .get(svc.url("/v1/items"))
+            .header("PAYMENT-SIGNATURE", &payment)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    assert_eq!(mocks.facilitator.verify_count(), 2);
+    assert_eq!(mocks.facilitator.settle_count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_non_unicode_replay_cache_configuration() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let output = Command::new(BIN)
+        .env_clear()
+        .env("PAY_TO", PAY_TO)
+        .env("UPSTREAM_URL", "http://localhost:1")
+        .env("RUST_LOG", "off")
+        .env(
+            "PAYMENT_REPLAY_CACHE_SIZE",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("PAYMENT_REPLAY_CACHE_SIZE must be an integer between 1 and 1000000"));
+}
+
 #[tokio::test]
 async fn replay_guard_capacity_preserves_records_and_keeps_health_routes_free() {
     let mocks = Mocks::start().await;

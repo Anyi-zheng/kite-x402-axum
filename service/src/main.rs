@@ -160,9 +160,23 @@ async fn main() {
         clock_drift_secs.map(|drift| kite_x402_axum::ExpirationGuardConfig::new(drift, 5));
 
     let metrics = Arc::new(PaymentMetrics::new());
-    let replay_cache_size = env::var("PAYMENT_REPLAY_CACHE_SIZE")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok());
+    let replay_cache_size = env::var_os("PAYMENT_REPLAY_CACHE_SIZE")
+        .map(|value| {
+            value.into_string().unwrap_or_else(|_| {
+                panic!("PAYMENT_REPLAY_CACHE_SIZE must be an integer between 1 and 1000000")
+            })
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let capacity: usize = value
+                .trim()
+                .parse()
+                .expect("PAYMENT_REPLAY_CACHE_SIZE must be an integer between 1 and 1000000");
+            if !(1..=1_000_000).contains(&capacity) {
+                panic!("PAYMENT_REPLAY_CACHE_SIZE must be an integer between 1 and 1000000");
+            }
+            capacity
+        });
     let nonce_guard = replay_cache_size
         .map(|cap| Arc::new(kite_x402_axum::PaymentNonceReplayGuard::new(cap, 3600)));
 
