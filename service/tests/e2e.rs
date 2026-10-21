@@ -1475,7 +1475,170 @@ async fn security_headers_can_be_disabled_via_env() {
 }
 
 #[tokio::test]
+async fn replay_guard_retries_known_failures_and_blocks_completed_payments() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("PAYMENT_REPLAY_CACHE_SIZE".into(), "1".into()));
+    let svc = Service::start(env).await;
+    let requirements = svc.requirements("/v1/items").await;
+    let payment = payment_header(&requirements);
+    mocks.facilitator.set_verify(Reply::Raw {
+        status: 503,
+        body: "temporary outage".into(),
+    });
+    let rejected = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("PAYMENT-SIGNATURE", &payment)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 402);
+    assert!(header_json(&rejected, "payment-required")["error"]
+        .as_str()
+        .unwrap()
+        .contains("facilitator verify unavailable"));
+    assert_eq!(mocks.upstream.count(), 0);
 
+    mocks.facilitator.set_verify(common::verify_ok());
+    mocks.upstream.set_reply(UpstreamReply::json(503));
+    let rejected = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("X-PAYMENT", &payment)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 503);
+    assert_eq!(mocks.facilitator.settle_count(), 0);
+
+    mocks.upstream.set_reply(UpstreamReply::json(200));
+    let completed = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("PAYMENT-SIGNATURE", &payment)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), 200);
+    assert!(completed.headers().contains_key("payment-response"));
+    let duplicate = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("X-PAYMENT", &payment)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), 402);
+    assert!(header_json(&duplicate, "payment-required")["error"]
+        .as_str()
+        .unwrap()
+        .contains("already been used"));
+    assert_eq!(mocks.facilitator.verify_count(), 3);
+    assert_eq!(mocks.upstream.count(), 2);
+    assert_eq!(mocks.facilitator.settle_count(), 1);
+}
+
+#[tokio::test]
+async fn replay_guard_capacity_preserves_records_and_keeps_health_routes_free() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("PAYMENT_REPLAY_CACHE_SIZE".into(), "1".into()));
+    let svc = Service::start(env).await;
+    let requirements = svc.requirements("/v1/items").await;
+    let encode = |nonce: &str| {
+        STANDARD.encode(serde_json::to_vec(&json!({
+        "x402Version": 2,
+        "accepted": requirements,
+        "payload": {"signature":"test-signature", "authorization":{"from":PAYER, "nonce":nonce}}
+    })).unwrap())
+    };
+    let first = encode("0xaaaa");
+    let second = encode("0xbbbb");
+    let completed = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("PAYMENT-SIGNATURE", &first)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), 200);
+    let saturated = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("PAYMENT-SIGNATURE", &second)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), 503);
+    assert_eq!(saturated.headers()["cache-control"], "no-store");
+    assert_eq!(saturated.headers()["retry-after"], "1");
+    assert_eq!(
+        saturated.json::<Value>().await.unwrap()["error"],
+        "payment_replay_capacity_exceeded"
+    );
+    assert_eq!(
+        svc.http
+            .get(svc.url("/v1/items"))
+            .header("PAYMENT-SIGNATURE", &first)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        402
+    );
+    for path in ["/healthz", "/livez", "/metrics"] {
+        assert_eq!(svc.get(path).await.status(), 200);
+    }
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+    assert_eq!(mocks.upstream.count(), 1);
+    assert_eq!(mocks.facilitator.settle_count(), 1);
+}
+
+#[tokio::test]
+async fn replay_guard_retains_authorization_after_uncertain_settlement() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("PAYMENT_REPLAY_CACHE_SIZE".into(), "1".into()),
+        ("FACILITATOR_TIMEOUT_MS".into(), "200".into()),
+        ("FACILITATOR_SETTLE_RETRIES".into(), "0".into()),
+    ]);
+    let svc = Service::start(env).await;
+    let payment = payment_header(&svc.requirements("/v1/items").await);
+    mocks
+        .facilitator
+        .set_settle(Reply::Delayed(Duration::from_secs(60), json!({})));
+    let uncertain = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("PAYMENT-SIGNATURE", &payment)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uncertain.status(), 402);
+    assert_eq!(
+        header_json(&uncertain, "payment-response")["success"],
+        false
+    );
+    let duplicate = svc
+        .http
+        .get(svc.url("/v1/items"))
+        .header("PAYMENT-SIGNATURE", &payment)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), 402);
+    assert!(header_json(&duplicate, "payment-required")["error"]
+        .as_str()
+        .unwrap()
+        .contains("already been used"));
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+    assert_eq!(mocks.upstream.count(), 1);
+    assert_eq!(mocks.facilitator.settle_count(), 1);
+}
+
+#[tokio::test]
 async fn replayed_payment_signature_is_rejected_on_second_request() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
