@@ -1345,6 +1345,45 @@ async fn metrics_endpoint_tracks_unpaid_challenge_and_settlement() {
     assert_eq!(after_snap.settlement_success_rate, 1.0);
 }
 
+#[tokio::test]
+async fn response_carries_security_headers_by_default() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    let res = svc.http.get(svc.url("/healthz")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(res.headers()["x-frame-options"], "DENY");
+    assert_eq!(res.headers()["x-xss-protection"], "0");
+    assert_eq!(
+        res.headers()["referrer-policy"],
+        "strict-origin-when-cross-origin"
+    );
+    assert_eq!(
+        res.headers()["content-security-policy"],
+        "default-src 'none'; frame-ancestors 'none'"
+    );
+
+    let res = svc.http.get(svc.url("/v1/forecast")).send().await.unwrap();
+    assert_eq!(res.status(), 402);
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(res.headers()["x-frame-options"], "DENY");
+}
+
+#[tokio::test]
+async fn security_headers_can_be_disabled_via_env() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("SECURITY_HEADERS_ENABLED".into(), "false".into()));
+    let svc = Service::start(env).await;
+
+    let res = svc.http.get(svc.url("/healthz")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(!res.headers().contains_key("x-content-type-options"));
+    assert!(!res.headers().contains_key("x-frame-options"));
+    assert!(!res.headers().contains_key("content-security-policy"));
+}
+
 // Keep the import used on non-unix targets too.
 #[allow(dead_code)]
 fn _unused(_: Reply) {}
