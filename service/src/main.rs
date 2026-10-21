@@ -70,14 +70,14 @@ async fn main() {
     let rate_limit_rps: f64 = env_or("RATE_LIMIT_RPS", "0")
         .parse()
         .expect("RATE_LIMIT_RPS must be a number");
-    if rate_limit_rps < 0.0 {
-        panic!("RATE_LIMIT_RPS must be non-negative");
+    if !rate_limit_rps.is_finite() || rate_limit_rps < 0.0 {
+        panic!("RATE_LIMIT_RPS must be a finite non-negative number");
     }
     let rate_limit_burst: f64 = env_or("RATE_LIMIT_BURST", &rate_limit_rps.to_string())
         .parse()
         .expect("RATE_LIMIT_BURST must be a number");
-    if rate_limit_burst < 0.0 {
-        panic!("RATE_LIMIT_BURST must be non-negative");
+    if !rate_limit_burst.is_finite() || rate_limit_burst < 0.0 {
+        panic!("RATE_LIMIT_BURST must be a finite non-negative number");
     }
 
     let rate_limiter: Arc<Option<TokenBucketRateLimiter>> = Arc::new(if rate_limit_rps > 0.0 {

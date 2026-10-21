@@ -1077,19 +1077,22 @@ fn refuses_to_start_when_the_port_is_already_taken() {
 }
 
 #[test]
-#[test]
-fn refuses_negative_rate_limit() {
-    let (status, stderr) = run_expecting_failure(vec![
-        ("PAY_TO", PAY_TO),
-        ("UPSTREAM_URL", "http://localhost:1"),
-        ("RATE_LIMIT_RPS", "-5"),
-        ("RUST_LOG", "off"),
-    ]);
-    assert!(!status.success());
-    assert!(
-        stderr.contains("RATE_LIMIT_RPS must be non-negative"),
-        "{stderr}"
-    );
+fn refuses_negative_and_non_finite_rate_limits() {
+    for key in ["RATE_LIMIT_RPS", "RATE_LIMIT_BURST"] {
+        for value in ["-5", "NaN", "inf", "-inf", "1e999"] {
+            let (status, stderr) = run_expecting_failure(vec![
+                ("PAY_TO", PAY_TO),
+                ("UPSTREAM_URL", "http://localhost:1"),
+                (key, value),
+                ("RUST_LOG", "off"),
+            ]);
+            assert!(!status.success(), "{key}={value} must fail startup");
+            assert!(
+                stderr.contains(&format!("{key} must be a finite non-negative number")),
+                "{key}={value}: {stderr}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
