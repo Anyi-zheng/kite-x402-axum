@@ -160,6 +160,12 @@ async fn main() {
         clock_drift_secs.map(|drift| kite_x402_axum::ExpirationGuardConfig::new(drift, 5));
 
     let metrics = Arc::new(PaymentMetrics::new());
+    let replay_cache_size = env::var("PAYMENT_REPLAY_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    let nonce_guard = replay_cache_size
+        .map(|cap| Arc::new(kite_x402_axum::PaymentNonceReplayGuard::new(cap, 3600)));
+
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,
         chain,
@@ -172,6 +178,7 @@ async fn main() {
         .with_retry_config(retry_cfg),
         expiration_guard,
         metrics: Some(Arc::clone(&metrics)),
+        nonce_guard,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: http_client,
