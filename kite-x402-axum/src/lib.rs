@@ -71,7 +71,7 @@ pub mod types;
 pub mod wire;
 
 pub use expiration::{ExpirationError, ExpirationGuardConfig};
-pub use facilitator::{FacilitatorClient, FacilitatorError};
+pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
 pub use middleware::{x402_payment, PaymentConfig};
 pub use proxy::{proxy, UpstreamConfig};

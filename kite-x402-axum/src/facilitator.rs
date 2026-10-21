@@ -6,13 +6,52 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::types::{PaymentPayload, PaymentRequirements, SettleResponse, VerifyResponse};
 
 /// Default per-request timeout for facilitator HTTP calls.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Configuration for retrying transient facilitator communication failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum number of retries for transient failures. 0 disables retries.
+    pub max_retries: u32,
+    /// Initial backoff delay for the first retry.
+    pub initial_backoff: Duration,
+    /// Upper bound for exponential backoff delay.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(2),
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Creates a new retry configuration.
+    pub fn new(max_retries: u32, initial_backoff: Duration, max_backoff: Duration) -> Self {
+        Self {
+            max_retries,
+            initial_backoff,
+            max_backoff,
+        }
+    }
+
+    /// Calculates backoff duration for the given 0-indexed attempt using exponential backoff.
+    pub fn calculate_backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u64.saturating_pow(attempt);
+        let backoff = self.initial_backoff.saturating_mul(factor as u32);
+        std::cmp::min(backoff, self.max_backoff)
+    }
+}
 
 /// A facilitator call failed at the transport or protocol level (the
 /// facilitator was unreachable, timed out, or returned something that
@@ -39,6 +78,7 @@ pub enum FacilitatorError {
 pub struct FacilitatorClient {
     http: reqwest::Client,
     base_url: String,
+    retry_config: RetryConfig,
 }
 
 #[derive(Serialize)]
@@ -57,6 +97,22 @@ impl FacilitatorClient {
         &self.base_url
     }
 
+    /// Returns the active retry configuration.
+    pub fn retry_config(&self) -> RetryConfig {
+        self.retry_config
+    }
+
+    /// Sets retry configuration using a builder pattern.
+    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+        self.retry_config = config;
+        self
+    }
+
+    /// Sets retry configuration in-place.
+    pub fn set_retry_config(&mut self, config: RetryConfig) {
+        self.retry_config = config;
+    }
+
     /// Builds a client for `base_url` with [`DEFAULT_TIMEOUT`].
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_timeout(base_url, DEFAULT_TIMEOUT)
@@ -71,7 +127,17 @@ impl FacilitatorClient {
         Self {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            retry_config: RetryConfig::default(),
         }
+    }
+
+    /// Builds a client for `base_url` with custom timeout and retry configuration.
+    pub fn with_retry(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        retry_config: RetryConfig,
+    ) -> Self {
+        Self::with_timeout(base_url, timeout).with_retry_config(retry_config)
     }
 
     /// Calls `POST {base_url}/verify`.
