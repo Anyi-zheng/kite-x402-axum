@@ -7,11 +7,11 @@
 //! README in this directory for how to run it.
 
 use std::{
-    collections::HashMap,
     env,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -34,7 +34,11 @@ use kite_x402_axum::{
 use serde_json::json;
 
 mod cors;
+mod rate_limit;
 use cors::{cors_middleware, CorsConfig};
+use rate_limit::{
+    rate_limit_middleware, RateLimiterConfig, TokenBucketRateLimiter, TrustedProxies,
+};
 
 #[tokio::main]
 async fn main() {
@@ -80,10 +84,13 @@ async fn main() {
         panic!("RATE_LIMIT_BURST must be a finite non-negative number");
     }
 
+    let trusted_proxies = TrustedProxies::parse(&env_or("RATE_LIMIT_TRUSTED_PROXIES", ""))
+        .unwrap_or_else(|message| panic!("{message}"));
     let rate_limiter: Arc<Option<TokenBucketRateLimiter>> = Arc::new(if rate_limit_rps > 0.0 {
         Some(TokenBucketRateLimiter::new(RateLimiterConfig {
             rps: rate_limit_rps,
             burst: rate_limit_burst.max(1.0),
+            trusted_proxies,
         }))
     } else {
         None
@@ -269,10 +276,13 @@ async fn main() {
         "kite-x402 wrapper listening on 0.0.0.0:{port} (network={network_name})"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("server error");
 
     tracing::info!("Server shut down gracefully");
 }
@@ -515,122 +525,6 @@ pub async fn security_headers_middleware(
     }
 
     response
-}
-
-#[derive(Clone, Debug)]
-pub struct RateLimiterConfig {
-    pub rps: f64,
-    pub burst: f64,
-}
-
-#[derive(Debug)]
-struct Bucket {
-    tokens: f64,
-    last_refill: Instant,
-}
-
-#[derive(Debug)]
-pub struct TokenBucketRateLimiter {
-    pub config: RateLimiterConfig,
-    buckets: Mutex<HashMap<String, Bucket>>,
-}
-
-impl TokenBucketRateLimiter {
-    pub fn new(config: RateLimiterConfig) -> Self {
-        Self {
-            config,
-            buckets: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn acquire(&self, client_key: &str) -> Result<u64, u64> {
-        let mut buckets = self.buckets.lock().unwrap();
-        let now = Instant::now();
-        let bucket = buckets
-            .entry(client_key.to_string())
-            .or_insert_with(|| Bucket {
-                tokens: self.config.burst,
-                last_refill: now,
-            });
-
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * self.config.rps).min(self.config.burst);
-        bucket.last_refill = now;
-
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            Ok(bucket.tokens as u64)
-        } else {
-            let needed = 1.0 - bucket.tokens;
-            let wait_secs = (needed / self.config.rps).ceil() as u64;
-            Err(wait_secs.max(1))
-        }
-    }
-}
-
-async fn rate_limit_middleware(
-    State(limiter): State<Arc<Option<TokenBucketRateLimiter>>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    if let Some(limiter) = limiter.as_ref() {
-        let client_ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(|s| s.trim().to_string())
-            .or_else(|| {
-                req.headers()
-                    .get("x-real-ip")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.trim().to_string())
-            })
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-
-        match limiter.acquire(&client_ip) {
-            Ok(remaining) => {
-                let mut response = next.run(req).await;
-                if let Ok(limit_val) = limiter.config.rps.to_string().parse() {
-                    response
-                        .headers_mut()
-                        .insert("x-ratelimit-limit", limit_val);
-                }
-                if let Ok(rem_val) = remaining.to_string().parse() {
-                    response
-                        .headers_mut()
-                        .insert("x-ratelimit-remaining", rem_val);
-                }
-                response
-            }
-            Err(retry_after) => {
-                tracing::warn!(client_ip = %client_ip, "Rate limit exceeded (429)");
-                let mut res = (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "error": "rate_limit_exceeded",
-                        "message": "Too many requests, please slow down."
-                    })),
-                )
-                    .into_response();
-                if let Ok(retry_val) = retry_after.to_string().parse() {
-                    res.headers_mut().insert("retry-after", retry_val);
-                }
-                if let Ok(limit_val) = limiter.config.rps.to_string().parse() {
-                    res.headers_mut().insert("x-ratelimit-limit", limit_val);
-                }
-                if let Ok(rem_val) = "0".parse() {
-                    res.headers_mut().insert("x-ratelimit-remaining", rem_val);
-                }
-                if let Ok(cc_val) = "no-store".parse() {
-                    res.headers_mut().insert("cache-control", cc_val);
-                }
-                res
-            }
-        }
-    } else {
-        next.run(req).await
-    }
 }
 
 async fn livez(State(metrics): State<Arc<ServiceMetrics>>) -> Json<serde_json::Value> {
@@ -997,70 +891,5 @@ mod tests {
             "default-src 'self'"
         );
         assert_eq!(res.headers()["referrer-policy"], "no-referrer");
-    }
-
-    #[test]
-    fn rate_limiter_allows_burst_and_depletes() {
-        let limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
-            rps: 1.0,
-            burst: 2.0,
-        });
-
-        // First two should succeed
-        assert!(limiter.acquire("127.0.0.1").is_ok());
-        assert!(limiter.acquire("127.0.0.1").is_ok());
-
-        // Third should be rate limited
-        let res = limiter.acquire("127.0.0.1");
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), 1);
-
-        // Different IP has separate bucket
-        assert!(limiter.acquire("192.168.1.1").is_ok());
-    }
-
-    #[tokio::test]
-    async fn rate_limit_middleware_returns_429_when_depleted() {
-        let limiter = Arc::new(Some(TokenBucketRateLimiter::new(RateLimiterConfig {
-            rps: 1.0,
-            burst: 1.0,
-        })));
-
-        let app = Router::new()
-            .route("/test", get(|| async { StatusCode::OK }))
-            .layer(middleware::from_fn_with_state(
-                limiter,
-                rate_limit_middleware,
-            ));
-
-        // First request is allowed (200)
-        let res1 = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/test")
-                    .header("x-forwarded-for", "10.0.0.1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res1.status(), StatusCode::OK);
-        assert_eq!(res1.headers()["x-ratelimit-remaining"], "0");
-
-        // Second request triggers 429
-        let res2 = app
-            .oneshot(
-                Request::builder()
-                    .uri("/test")
-                    .header("x-forwarded-for", "10.0.0.1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res2.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(res2.headers()["retry-after"], "1");
-        assert_eq!(res2.headers()["cache-control"], "no-store");
     }
 }

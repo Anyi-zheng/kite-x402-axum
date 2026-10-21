@@ -1116,6 +1116,103 @@ async fn rate_limiting_protects_service_without_charging() {
     assert!(mocks.timeline().is_empty());
 }
 
+#[tokio::test]
+async fn untrusted_forwarding_headers_cannot_reset_rate_limits() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+    ]);
+    let svc = Service::start(env).await;
+    assert_eq!(svc.get("/v1/test").await.status(), 402);
+    for (name, value) in [
+        ("X-Forwarded-For", "192.0.2.1"),
+        ("X-Forwarded-For", "192.0.2.2"),
+        ("X-Real-IP", "203.0.113.1"),
+        ("X-Forwarded-For", "invalid"),
+    ] {
+        assert_eq!(
+            svc.http
+                .get(svc.url("/v1/test"))
+                .header(name, value)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            429
+        );
+    }
+    assert_eq!(svc.get("/healthz").await.status(), 200);
+    assert!(mocks.timeline().is_empty());
+}
+
+#[tokio::test]
+async fn trusted_proxy_chains_keep_client_quotas_isolated() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.extend([
+        ("RATE_LIMIT_RPS".into(), "0.001".into()),
+        ("RATE_LIMIT_BURST".into(), "1".into()),
+        ("RATE_LIMIT_TRUSTED_PROXIES".into(), "127.0.0.0/8".into()),
+    ]);
+    let svc = Service::start(env).await;
+    for (value, status) in [
+        ("192.0.2.1, 198.51.100.1, 127.0.0.2", 402),
+        ("192.0.2.2, 198.51.100.1, 127.0.0.2", 429),
+        ("198.51.100.2, 127.0.0.2", 402),
+        ("198.51.100.3, bad", 400),
+    ] {
+        assert_eq!(
+            svc.http
+                .get(svc.url("/v1/test"))
+                .header("X-Forwarded-For", value)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            status,
+            "{value}"
+        );
+    }
+    assert_eq!(
+        svc.http
+            .get(svc.url("/v1/test"))
+            .header("X-Real-IP", "198.51.100.3")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        402
+    );
+    assert_eq!(
+        svc.http
+            .get(svc.url("/v1/test"))
+            .header("X-Forwarded-For", "198.51.100.3")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        429
+    );
+    assert!(mocks.timeline().is_empty());
+}
+
+#[test]
+fn refuses_invalid_trusted_proxy_configuration() {
+    for value in ["*", "127.0.0.1/33", "::/129", "127.0.0.1,", "not-an-ip"] {
+        let (status, stderr) = run_expecting_failure(vec![
+            ("PAY_TO", PAY_TO),
+            ("UPSTREAM_URL", "http://localhost:1"),
+            ("RATE_LIMIT_TRUSTED_PROXIES", value),
+            ("RUST_LOG", "off"),
+        ]);
+        assert!(!status.success());
+        assert!(stderr.contains("RATE_LIMIT_TRUSTED_PROXIES"), "{stderr}");
+    }
+}
+
 #[test]
 fn refuses_invalid_timeout_configurations() {
     let (status, stderr) = run_expecting_failure(vec![
