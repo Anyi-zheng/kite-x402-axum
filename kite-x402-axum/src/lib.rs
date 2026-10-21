@@ -65,6 +65,7 @@
 pub mod expiration;
 pub mod facilitator;
 pub mod kite;
+pub mod metrics;
 pub mod middleware;
 pub mod proxy;
 pub mod types;
@@ -73,5 +74,6 @@ pub mod wire;
 pub use expiration::{ExpirationError, ExpirationGuardConfig};
 pub use facilitator::{FacilitatorClient, FacilitatorError};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
+pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
 pub use middleware::{x402_payment, PaymentConfig};
 pub use proxy::{proxy, UpstreamConfig};

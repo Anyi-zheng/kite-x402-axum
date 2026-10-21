@@ -21,6 +21,7 @@ use kite_x402_axum::{
     kite::{kite_chain_by_name, FACILITATOR_URL},
     middleware::{x402_payment, PaymentConfig},
     proxy::{proxy, same_origin_redirect_policy, UpstreamConfig},
+    PaymentMetrics, PaymentMetricsSnapshot,
 };
 use serde_json::json;
 
@@ -90,6 +91,7 @@ async fn main() {
     let expiration_guard =
         clock_drift_secs.map(|drift| kite_x402_axum::ExpirationGuardConfig::new(drift, 5));
 
+    let metrics = Arc::new(PaymentMetrics::new());
     let payment_cfg = Arc::new(PaymentConfig {
         pay_to,
         chain,
@@ -97,6 +99,7 @@ async fn main() {
         description,
         facilitator: FacilitatorClient::new(facilitator_url),
         expiration_guard,
+        metrics: Some(Arc::clone(&metrics)),
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: http_client,
@@ -115,12 +118,17 @@ async fn main() {
             x402_payment,
         ));
 
+    let metrics_router = Router::new()
+        .route("/metrics/x402", axum::routing::get(metrics_x402_handler))
+        .with_state(Arc::clone(&metrics));
+
     let mut app = Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route(
             "/readyz",
             axum::routing::get(readyz).with_state(payment_cfg),
         )
+        .merge(metrics_router)
         .nest("/v1", paid)
         .fallback(not_found)
         .layer(middleware::from_fn(http_request_logger));
@@ -173,6 +181,13 @@ async fn not_found() -> (StatusCode, Json<serde_json::Value>) {
             "message": "route not found"
         })),
     )
+}
+
+async fn metrics_x402_handler(
+    axum::extract::State(metrics): axum::extract::State<Arc<PaymentMetrics>>,
+) -> Json<PaymentMetricsSnapshot> {
+    tracing::debug!("Handling /metrics/x402 request");
+    Json(metrics.snapshot())
 }
 
 async fn http_request_logger(mut req: Request, next: Next) -> Response {

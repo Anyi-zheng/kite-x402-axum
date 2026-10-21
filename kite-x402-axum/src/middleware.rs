@@ -40,6 +40,8 @@ pub struct PaymentConfig {
     pub facilitator: FacilitatorClient,
     /// Optional expiration guard to reject expired or premature authorizations early.
     pub expiration_guard: Option<crate::expiration::ExpirationGuardConfig>,
+    /// Optional metrics collector to track payment telemetry.
+    pub metrics: Option<Arc<crate::metrics::PaymentMetrics>>,
 }
 
 impl PaymentConfig {
@@ -57,6 +59,7 @@ impl PaymentConfig {
             description: description.into(),
             facilitator,
             expiration_guard: None,
+            metrics: None,
         }
     }
 
@@ -65,6 +68,11 @@ impl PaymentConfig {
         guard: crate::expiration::ExpirationGuardConfig,
     ) -> Self {
         self.expiration_guard = Some(guard);
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::PaymentMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -165,6 +173,10 @@ pub async fn x402_payment(
         .unwrap_or_else(|| req.uri().to_string());
     let method = req.method().clone();
 
+    if let Some(metrics) = &cfg.metrics {
+        metrics.record_request();
+    }
+
     tracing::debug!(
         method = %method,
         uri = %resource_url,
@@ -203,6 +215,9 @@ pub async fn x402_payment(
             requirements = ?requirements,
             "402 challenge requirements details"
         );
+        if let Some(metrics) = &cfg.metrics {
+            metrics.record_challenge();
+        }
         return payment_required_response(
             requirements,
             resource_url,
@@ -223,6 +238,9 @@ pub async fn x402_payment(
                 uri = %resource_url,
                 "Failed to decode payment signature header; returning 402"
             );
+            if let Some(metrics) = &cfg.metrics {
+                metrics.record_challenge();
+            }
             return payment_required_response(
                 requirements,
                 resource_url,
@@ -239,6 +257,9 @@ pub async fn x402_payment(
             actual = ?payload.accepted,
             "Payment requirements mismatch; returning 402"
         );
+        if let Some(metrics) = &cfg.metrics {
+            metrics.record_challenge();
+        }
         return payment_required_response(
             requirements,
             resource_url,
@@ -298,6 +319,10 @@ pub async fn x402_payment(
                 error = %e,
                 "Facilitator verify unavailable; returning 402"
             );
+            if let Some(metrics) = &cfg.metrics {
+                metrics.record_verification(false);
+                metrics.record_challenge();
+            }
             return payment_required_response(
                 requirements,
                 resource_url,
@@ -317,12 +342,20 @@ pub async fn x402_payment(
             payer = ?verify.payer,
             "Payment rejected by facilitator; returning 402"
         );
+        if let Some(metrics) = &cfg.metrics {
+            metrics.record_verification(false);
+            metrics.record_challenge();
+        }
         return payment_required_response(
             requirements,
             resource_url,
             cfg.description.clone(),
             Some(reason),
         );
+    }
+
+    if let Some(metrics) = &cfg.metrics {
+        metrics.record_verification(true);
     }
 
     tracing::info!(
@@ -358,10 +391,20 @@ pub async fn x402_payment(
         "Upstream succeeded; settling payment with facilitator"
     );
 
+    let settle_start = std::time::Instant::now();
     let settle_outcome = cfg.facilitator.settle(&payload, &requirements).await;
+    let settle_duration = settle_start.elapsed();
     let settle = match settle_outcome {
-        Ok(s) => s,
+        Ok(s) => {
+            if let Some(metrics) = &cfg.metrics {
+                metrics.record_settlement(s.success, settle_duration);
+            }
+            s
+        }
         Err(e) => {
+            if let Some(metrics) = &cfg.metrics {
+                metrics.record_settlement(false, settle_duration);
+            }
             tracing::error!(
                 uri = %resource_url,
                 error = %e,
@@ -466,6 +509,7 @@ mod tests {
             description: "Unit test service".to_string(),
             facilitator: dead_facilitator(),
             expiration_guard: None,
+            metrics: None,
         })
     }
 
@@ -828,5 +872,30 @@ mod tests {
         assert_eq!(reached.load(Ordering::SeqCst), 0);
         let header = decode_header(&resp, "PAYMENT-REQUIRED");
         assert!(header["error"].as_str().unwrap().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn middleware_records_metrics_on_unauthenticated_request() {
+        let metrics = Arc::new(crate::metrics::PaymentMetrics::new());
+        let cfg = Arc::new(
+            PaymentConfig::new(
+                PAY_TO,
+                KITE_TESTNET,
+                "0.001",
+                "Unit test service",
+                dead_facilitator(),
+            )
+            .with_metrics(metrics.clone()),
+        );
+
+        let (svc, _) = gate(cfg);
+        let resp = svc.oneshot(request("/v1/data", &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.challenges_total, 1);
+        assert_eq!(snap.verifications_success, 0);
+        assert_eq!(snap.settlements_success, 0);
     }
 }

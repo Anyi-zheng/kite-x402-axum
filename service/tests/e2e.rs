@@ -1314,6 +1314,37 @@ async fn expired_payment_signature_is_rejected_without_calling_facilitator() {
     assert_eq!(mocks.upstream.count(), 0);
 }
 
+#[tokio::test]
+async fn metrics_endpoint_tracks_unpaid_challenge_and_settlement() {
+    let mocks = Mocks::start().await;
+    let svc = Service::start_with(&mocks).await;
+
+    // Check initial metrics
+    let resp = svc.get("/metrics/x402").await;
+    assert_eq!(resp.status(), 200);
+    let init_snap: kite_x402_axum::PaymentMetricsSnapshot = resp.json().await.unwrap();
+    assert_eq!(init_snap.requests_total, 0);
+    assert_eq!(init_snap.challenges_total, 0);
+    assert_eq!(init_snap.settlements_success, 0);
+
+    // Make an unpaid probe (returns 402 challenge)
+    let probe = svc.get("/v1/forecast").await;
+    assert_eq!(probe.status(), 402);
+
+    // Make a paid request that settles
+    let paid = svc.pay_get("/v1/forecast").await;
+    assert_eq!(paid.status(), 200);
+
+    // Verify metrics updated
+    let resp2 = svc.get("/metrics/x402").await;
+    assert_eq!(resp2.status(), 200);
+    let after_snap: kite_x402_axum::PaymentMetricsSnapshot = resp2.json().await.unwrap();
+    assert!(after_snap.requests_total >= 2);
+    assert!(after_snap.challenges_total >= 1);
+    assert_eq!(after_snap.settlements_success, 1);
+    assert_eq!(after_snap.settlement_success_rate, 1.0);
+}
+
 // Keep the import used on non-unix targets too.
 #[allow(dead_code)]
 fn _unused(_: Reply) {}
