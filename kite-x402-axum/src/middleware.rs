@@ -994,5 +994,4 @@ mod tests {
         let header2 = decode_header(&resp2, "PAYMENT-REQUIRED");
         assert!(header2["error"].as_str().unwrap().contains("already been used"));
     }
-    }
 }

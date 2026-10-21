@@ -1475,6 +1475,40 @@ async fn security_headers_can_be_disabled_via_env() {
     assert!(!res.headers().contains_key("content-security-policy"));
 }
 
+#[tokio::test]
+async fn replayed_payment_signature_is_rejected_on_second_request() {
+    let mocks = Mocks::start().await;
+    let mut env = Service::base_env(&mocks, free_port());
+    env.push(("PAYMENT_REPLAY_CACHE_SIZE".into(), "100".into()));
+    let svc = Service::start(env).await;
+
+    let reqs = svc.requirements("/v1/forecast").await;
+    let header_val = payment_header(&reqs);
+
+    let resp1 = svc
+        .http
+        .get(svc.url("/v1/forecast"))
+        .header("PAYMENT-SIGNATURE", &header_val)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), 200);
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+
+    let resp2 = svc
+        .http
+        .get(svc.url("/v1/forecast"))
+        .header("PAYMENT-SIGNATURE", &header_val)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 402);
+    let challenge = header_json(&resp2, "payment-required");
+    assert!(challenge["error"].as_str().unwrap().contains("already been used"));
+    assert_eq!(mocks.facilitator.verify_count(), 1);
+}
+}
+
 // Keep the import used on non-unix targets too.
 #[allow(dead_code)]
 fn _unused(_: Reply) {}
