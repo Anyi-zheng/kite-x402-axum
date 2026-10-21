@@ -130,6 +130,7 @@ fn build_app(facilitator_base: &str, upstream_base: &str) -> Router {
         facilitator: FacilitatorClient::new(facilitator_base),
         expiration_guard: None,
         metrics: None,
+        nonce_guard: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: reqwest::Client::new(),

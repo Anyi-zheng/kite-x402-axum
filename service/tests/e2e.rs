@@ -1077,7 +1077,6 @@ fn refuses_to_start_when_the_port_is_already_taken() {
 }
 
 #[test]
-#[test]
 fn refuses_negative_rate_limit() {
     let (status, stderr) = run_expecting_failure(vec![
         ("PAY_TO", PAY_TO),
@@ -1509,6 +1508,7 @@ async fn replayed_payment_signature_is_rejected_on_second_request() {
     assert_eq!(mocks.facilitator.verify_count(), 1);
 }
 
+#[tokio::test]
 async fn concurrency_overflow_rejects_with_503_before_payment_and_releases_after() {
     let mocks = Mocks::start().await;
     let mut env = Service::base_env(&mocks, free_port());
