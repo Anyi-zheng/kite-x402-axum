@@ -97,6 +97,7 @@ async fn main() {
         description,
         facilitator: FacilitatorClient::new(facilitator_url),
         expiration_guard,
+        metrics: None,
     });
     let upstream_cfg = Arc::new(UpstreamConfig {
         http: http_client,
