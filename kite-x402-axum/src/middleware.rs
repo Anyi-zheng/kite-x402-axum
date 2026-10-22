@@ -310,22 +310,37 @@ pub async fn x402_payment(
         }
     }
 
-    if let Some(guard) = &cfg.nonce_guard {
-        let key = guard.extract_nonce_key(&payload);
-        if let Err(e) = guard.check_and_record(&key) {
-            tracing::warn!(
-                uri = %resource_url,
-                error = %e,
-                "Payment authorization rejected by nonce replay guard; returning 402"
-            );
-            return payment_required_response(
-                requirements,
-                resource_url,
-                cfg.description.clone(),
-                Some(e.to_string()),
-            );
+    let mut reservation = if let Some(guard) = &cfg.nonce_guard {
+        match guard.reserve(&payload) {
+            Ok(reservation) => Some(reservation),
+            Err(crate::nonce_guard::NonceReplayError::CapacityExceeded) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("cache-control", "no-store"), ("retry-after", "1")],
+                    Json(json!({ "error": "payment_replay_capacity_exceeded" })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    uri = %resource_url,
+                    error = %error,
+                    "Payment authorization rejected by nonce replay guard; returning 402"
+                );
+                if let Some(metrics) = &cfg.metrics {
+                    metrics.record_challenge();
+                }
+                return payment_required_response(
+                    requirements,
+                    resource_url,
+                    cfg.description.clone(),
+                    Some(error.to_string()),
+                );
+            }
         }
-    }
+    } else {
+        None
+    };
 
     tracing::debug!(
         uri = %resource_url,
@@ -400,10 +415,19 @@ pub async fn x402_payment(
         uri = %resource_url,
         "Running inner handler (forwarding to upstream)"
     );
+    // Cancellation after entering the handler has an uncertain execution outcome.
+    // Keep the reservation pending until completion, then retain it conservatively.
+    if let Some(reservation) = reservation.as_mut() {
+        reservation.retain_on_drop();
+    }
     let response = next.run(req).await;
 
     let status = response.status();
     if status.as_u16() >= 400 {
+        // This branch never calls settle, so the authorization is safe to retry.
+        if let Some(reservation) = reservation.take() {
+            reservation.release();
+        }
         tracing::warn!(
             uri = %resource_url,
             status = status.as_u16(),
@@ -946,7 +970,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replayed_nonce_is_rejected_on_second_request() {
+    async fn failed_verification_does_not_poison_the_authorization() {
         let guard = Arc::new(crate::nonce_guard::PaymentNonceReplayGuard::new(100, 60));
         let cfg = Arc::new(
             PaymentConfig::new(
@@ -974,7 +998,7 @@ mod tests {
 
         let (svc, reached) = gate(cfg);
 
-        // First attempt passes nonce guard, fails at facilitator (dead_facilitator => 402 with Facilitator unavailable)
+        // A verification failure must not consume the authorization.
         let resp1 = svc
             .clone()
             .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
@@ -987,7 +1011,7 @@ mod tests {
             .unwrap()
             .contains("already been used"));
 
-        // Second attempt with exact same nonce is rejected by replay guard
+        // The same authorization reaches verification again.
         let resp2 = svc
             .oneshot(request("/v1/data", &[("PAYMENT-SIGNATURE", &encoded)]))
             .await
@@ -998,6 +1022,6 @@ mod tests {
         assert!(header2["error"]
             .as_str()
             .unwrap()
-            .contains("already been used"));
+            .contains("facilitator verify unavailable"));
     }
 }

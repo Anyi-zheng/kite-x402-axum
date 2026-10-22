@@ -86,6 +86,44 @@ Clients exceeding their quota receive `429 Too Many Requests` with
 Rejected requests never contact the facilitator or upstream and incur no payment.
 `/healthz`, `/livez`, and `/metrics` remain free and outside this limiter.
 
+## Payment replay protection
+
+Set `PAYMENT_REPLAY_CACHE_SIZE=10000` to enable process-local authorization replay
+protection. Unset or blank values keep it disabled; configured values must be
+integers from `1` to `1000000`, otherwise startup fails. The service retains
+completed or uncertain authorizations for one hour after the operation ends.
+
+The guard reserves an authorization atomically before verification. Concurrent
+copies receive the existing `402` payment challenge without reaching the facilitator
+or upstream. EIP-3009 identity includes the network, asset, authorizer and nonce,
+so different payers can use the same nonce. Hex casing, signature variants, and
+resource/extension metadata do not create a fresh structured authorization.
+Payloads without this structure use their complete payment data and requirements
+as an opaque identity instead of a bare nonce or signature.
+
+| Outcome | Replay protection |
+| --- | --- |
+| Verification rejection, error, timeout, or cancellation | Release; the same authorization can be retried. |
+| Protected handler returns a status >= 400 | Release; settlement is never attempted. |
+| Any settlement attempt, including rejection, malformed response, or timeout | Retain conservatively; the authorization is not automatically reusable. |
+| Cancellation or unwinding after entering the protected handler | Retain; the execution outcome may be unknown. |
+
+Pending reservations never expire or get evicted. At cache capacity, new
+authorizations receive `503`, `Cache-Control: no-store`, `Retry-After: 1`, and
+`{"error":"payment_replay_capacity_exceeded"}` before any backend work. Existing
+duplicates still receive `402`. Unpaid challenges and free health/diagnostic routes
+remain available. The retry header is a hint, not a guarantee that a slot becomes
+available after one second. Expired retained entries are reclaimed on admissions,
+at most 64 per admission; both storage and the expiry index are capacity-bounded.
+
+This protection is local to one process, resets on restart, and ends after the
+retention TTL. It does not replace on-chain authorization checks, provide a shared
+cache across replicas, or guarantee exactly-once business effects. Transport errors
+can leave an upstream operation's result unknown even when no settlement occurs.
+Use a new authorization or reconcile an uncertain settlement rather than clearing
+the guard to retry it blindly. The facilitator client's configured settlement
+retry policy is unchanged by this guard.
+
 ## Health, Liveness & Diagnostics
 
 The service exposes endpoints outside `/v1/*` that are unmetered (free) and never invoke payment verification or settlement:

@@ -77,5 +77,5 @@ pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
 pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
 pub use middleware::{x402_payment, PaymentConfig};
-pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard};
+pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceReservation};
 pub use proxy::{proxy, UpstreamConfig};
