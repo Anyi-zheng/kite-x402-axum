@@ -75,6 +75,7 @@ pub mod proxy;
 pub mod security_headers;
 pub mod settlement_ledger;
 pub mod types;
+pub mod webhook;
 pub mod wire;
 
 pub use circuit_breaker::{
@@ -91,3 +92,7 @@ pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceRes
 pub use proxy::{proxy, UpstreamConfig};
 pub use security_headers::SecurityHeadersConfig;
 pub use settlement_ledger::{LedgerSummary, SettlementLedger, SettlementRecord};
+pub use webhook::{
+    DeliveryStatus, WebhookConfig, WebhookDeliveryRecord, WebhookDispatcher, WebhookEventType,
+    WebhookPayload,
+};
