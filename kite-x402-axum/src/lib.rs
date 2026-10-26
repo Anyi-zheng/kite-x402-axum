@@ -70,6 +70,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod nonce_guard;
 pub mod proxy;
+pub mod settlement_ledger;
 pub mod types;
 pub mod wire;
 
@@ -83,3 +84,4 @@ pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
 pub use middleware::{x402_payment, PaymentConfig};
 pub use nonce_guard::{NonceReplayError, PaymentNonceReplayGuard, PaymentNonceReservation};
 pub use proxy::{proxy, UpstreamConfig};
+pub use settlement_ledger::{LedgerSummary, SettlementLedger, SettlementRecord};
