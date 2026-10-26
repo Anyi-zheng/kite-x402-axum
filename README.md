@@ -367,3 +367,25 @@ Or deploy via Docker Compose:
 ```bash
 docker compose up -d
 ```
+
+
+## Contributing
+
+Contributions are welcome! Please follow these guidelines when submitting a pull request.
+
+### Before Submitting a Pull Request
+
+1. **Format your code.** Run `cargo fmt` before creating a pull request to ensure consistent code formatting.
+2. **Add tests.** New features and improvements must include corresponding tests to verify their behavior.
+3. **Run tests.** Run `cargo test` and ensure all tests pass before submitting your changes.
+
+### Pull Request Guidelines
+
+- Keep pull requests focused and clearly describe the changes.
+- Explain the motivation behind new features or improvements.
+- Include relevant test coverage for all new functionality and behavior changes.
+- Ensure your changes do not introduce unnecessary regressions.
+
+Thank you for contributing!
+
+Add the project’s required checksExplain how to open a pull request
