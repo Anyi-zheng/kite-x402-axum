@@ -65,6 +65,7 @@
 pub mod circuit_breaker;
 pub mod expiration;
 pub mod facilitator;
+pub mod idempotency;
 pub mod kite;
 pub mod metrics;
 pub mod middleware;
@@ -78,6 +79,7 @@ pub use circuit_breaker::{
 };
 pub use expiration::{ExpirationError, ExpirationGuardConfig};
 pub use facilitator::{FacilitatorClient, FacilitatorError, RetryConfig};
+pub use idempotency::{AcquireResult, CachedResponse, IdempotencyCache, IdempotencyConfig};
 pub use kite::{kite_chain_by_name, KiteChain, KiteError, KITE_MAINNET, KITE_TESTNET};
 pub use metrics::{PaymentMetrics, PaymentMetricsSnapshot};
 pub use middleware::{x402_payment, PaymentConfig};
